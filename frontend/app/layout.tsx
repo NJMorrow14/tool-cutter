@@ -1,16 +1,14 @@
+import type { Metadata, Viewport } from 'next';
 import './globals.css';
-import type { Metadata } from 'next';
 
 export const metadata: Metadata = {
-  title: 'ToolCutter Studio',
-  description: 'Segment tools with HQ-SAM and export SVG cutouts — powered by ToolCutter.',
+  title: 'ToolCutter',
+  description: 'Photo or 3D scan of laid-out tools → foam insert cutting files (SVG, DXF, STL).',
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export const viewport: Viewport = { width: 'device-width', initialScale: 1 };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <body>{children}</body>

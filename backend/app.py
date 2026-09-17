@@ -1,951 +1,525 @@
 #!/usr/bin/env python3
-"""
-Flask API that wraps Meta's HQ-SAM tooling to segment tool images and export SVG cutouts.
+"""ToolCutter API: 3D scans of laid-out tools (or single tool models) -> foam insert cutting files.
 
-Primary endpoints:
- - POST /api/upload_image -> accepts an image upload (JPEG/PNG/HEIC/etc.)
- - POST /api/preview      -> returns overlay + mask previews based on provided prompts
- - POST /api/export_svg   -> generates an SVG for download using the latest mask
- - GET  /health           -> readiness probe
+Flow:
+  POST /api/sessions                       upload a 3D file (ply/obj/glb/stl); classified as a mat layout scan or a
+                                           single tool model (form scan_kind=auto|layout|object)
+  POST /api/sessions/<id>/calibrate        4 corners of the mat/drawer + its real size -> top-down mm image
+  POST /api/sessions/<id>/auto_detect      find tools automatically (color or height), refine with HQ-SAM
+  POST /api/sessions/<id>/segment          (re)segment tools from click prompts
+  POST /api/layout                         processed outlines in mm (clearance, smoothing, notches); tools carry polygon_mm
+  POST /api/export                         SVG / DXF / STL download (same body + format)
+  GET  /api/sessions/<id>/image/<stage>    original | rectified | height preview JPEG
 
-Run:
-  python app.py --image ./images/overhead_aruco.jpg --host 127.0.0.1 --port 8000
-
-Dependencies:
-  pip install flask flask-cors numpy opencv-python svgwrite pillow pillow-heif (optional)
+Run:  python3 app.py --host 0.0.0.0 --port 8000
+Model: put sam_hq_vit_*.pth in backend/ or set HQSAM_CKPT.
 """
 from __future__ import annotations
 
 import argparse
-import base64
 import io
+import logging
 import os
-import subprocess
-import sys
-import tempfile
-from contextlib import nullcontext
-from pathlib import Path
-from typing import Any, Dict, Tuple, List, Optional
+import re
+import time
+from typing import Any, Dict, List, Optional
 
-from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
 import cv2
 import numpy as np
+from flask import Flask, Response, jsonify, request, send_file
+from flask_cors import CORS
 
-BACKEND_ROOT = Path(__file__).resolve().parent
-# Allow bundled SAM/HQ-SAM sources to be imported without separate installs.
-SAM_HQ_ROOTS = (
-    BACKEND_ROOT / 'sam-hq',
-    BACKEND_ROOT / 'sam-hq' / 'sam-hq2',
-)
-for _path in SAM_HQ_ROOTS:
-    if _path.exists():
-        p = str(_path)
-        if p not in sys.path:
-            sys.path.insert(0, p)
+from toolcutter import calibration, geometry, scan as scanmod
+from toolcutter.exporters import layout_to_dxf, layout_to_stl, layout_to_svg, layout_tools_to_stl
+from toolcutter.imaging import MESH_EXTENSIONS, downscale_to, encode_jpeg, height_to_colormap
+from toolcutter.segmenter import Segmenter, clean_mask
+from toolcutter.sessions import SessionStore
 
-import tool_image_to_svg as core
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("toolcutter")
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}, r"/health": {"origins": "*"}})
+app.config["MAX_CONTENT_LENGTH"] = 400 * 1024 * 1024
+CORS(app, resources={r"/api/*": {"origins": "*"}, r"/health": {"origins": "*"}}, expose_headers=["Content-Disposition"])
+
+STORE = SessionStore()
+SEGMENTER = Segmenter()
+DISPLAY_MAX_SIDE = 1800
 
 
-def bgr_to_png_bytes(img_bgr: np.ndarray) -> bytes:
-    ok, buf = cv2.imencode('.png', img_bgr)
-    if not ok:
-        raise RuntimeError('PNG encode failed')
-    return buf.tobytes()
+# ----------------------------------------------------------------------------- helpers
+
+class ApiError(Exception):
+    def __init__(self, message: str, status: int = 400):
+        super().__init__(message)
+        self.status = status
 
 
-def png_bytes_to_b64uri(png_bytes: bytes) -> str:
-    b64 = base64.b64encode(png_bytes).decode('ascii')
-    return f"data:image/png;base64,{b64}"
+@app.errorhandler(ApiError)
+def _handle_api_error(err: ApiError):
+    return jsonify({"error": str(err)}), err.status
 
 
-_HEIF_SETUP_DONE = False
+@app.errorhandler(Exception)
+def _handle_unexpected(err: Exception):  # noqa: BLE001
+    log.exception("Unhandled error")
+    return jsonify({"error": f"{type(err).__name__}: {err}"}), 500
 
 
-def _ensure_heif_opener() -> None:
-    """Register HEIF decoders with Pillow if available."""
-    global _HEIF_SETUP_DONE
-    if _HEIF_SETUP_DONE:
-        return
-    _HEIF_SETUP_DONE = True
-    try:
-        from pillow_heif import register_heif_opener  # type: ignore
-
-        register_heif_opener()
-    except Exception:
-        # Pillow may not have HEIF support installed; ignore silently.
-        pass
+def _session(sid: str):
+    s = STORE.get(sid)
+    if s is None:
+        raise ApiError("Unknown session (server restarted?). Upload again.", 404)
+    return s
 
 
-def _decode_heif_with_pillow(data: bytes) -> Optional[np.ndarray]:
-    try:
-        from PIL import Image  # type: ignore
-        from PIL import UnidentifiedImageError  # type: ignore
-    except Exception:
+def _require_rectified(s):
+    if s.rectified is None:
+        raise ApiError("Calibrate the mat corners first.")
+    return s
+
+
+def _f(d: Dict, key: str, default: Optional[float] = None) -> Optional[float]:
+    v = d.get(key, default)
+    if v is None:
         return None
-
-    _ensure_heif_opener()
     try:
-        with Image.open(io.BytesIO(data)) as pil_img:
-            pil_rgb = pil_img.convert('RGB')
-            return cv2.cvtColor(np.array(pil_rgb), cv2.COLOR_RGB2BGR)
-    except UnidentifiedImageError:
-        return None
-    except Exception:
-        return None
+        return float(v)
+    except (TypeError, ValueError):
+        raise ApiError(f"Field '{key}' must be a number")
 
 
-def _decode_heif_with_sips(data: bytes) -> Optional[np.ndarray]:
-    """macOS fallback: use `sips` to convert HEIC to JPEG."""
-    with tempfile.NamedTemporaryFile(suffix='.heic', delete=False) as src:
-        src_path = src.name
-        src.write(data)
-    dest_path = f"{src_path}.jpg"
-    try:
-        result = subprocess.run(
-            ['sips', '-s', 'format', 'jpeg', src_path, '--out', dest_path],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            return None
-        img = cv2.imread(dest_path, cv2.IMREAD_COLOR)
-        return img
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-    finally:
+def _points(raw: Any) -> List[Dict]:
+    out = []
+    for p in raw or []:
         try:
-            os.remove(src_path)
-        except OSError:
-            pass
-        try:
-            os.remove(dest_path)
-        except OSError:
-            pass
+            out.append({"x": float(p["x"]), "y": float(p["y"]), "label": 1 if p.get("label", "pos") in ("pos", 1, True) else 0})
+        except (KeyError, TypeError, ValueError):
+            raise ApiError("Each point needs numeric x, y and a label")
+    return out
 
 
-def decode_image_bytes_to_bgr(data: bytes) -> Tuple[Optional[np.ndarray], bool]:
-    """Decode raw image bytes into a BGR np.ndarray with HEIC fallback.
-
-    Returns (image, converted_to_jpeg) where the boolean indicates that we had
-    to route through Pillow (typically for HEIC/HEIF) and normalize to RGB
-    before converting back to OpenCV's BGR layout.
-    """
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is not None:
-        return img, False
-    pil_bgr = _decode_heif_with_pillow(data)
-    if pil_bgr is not None:
-        return pil_bgr, True
-    sips_bgr = _decode_heif_with_sips(data)
-    if sips_bgr is not None:
-        return sips_bgr, True
-    return None, False
-
-
-def load_image_from_path(path: str) -> Tuple[np.ndarray, bool]:
-    """Load an image from disk with HEIC->JPEG fallback."""
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is not None:
-        return img, False
-    with open(path, 'rb') as f:
-        data = f.read()
-    decoded, converted = decode_image_bytes_to_bgr(data)
-    if decoded is None:
-        raise RuntimeError(f'Unsupported image format: {path}')
-    return decoded, converted
-
-
-def rotate_bgr_image(img: np.ndarray, rotation: int) -> np.ndarray:
-    """Rotate an image (any channel count) in 90° increments clockwise."""
-    rot = int(rotation) % 360
-    if rot == 0:
-        return img.copy()
-    if rot == 90:
-        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-    if rot == 180:
-        return cv2.rotate(img, cv2.ROTATE_180)
-    if rot == 270:
-        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    raise ValueError('Rotation must be a multiple of 90 degrees')
-
-
-def _ensure_image_orientation(target_rotation: int) -> None:
-    """Rotate the stored image/mask in app.config to match target rotation."""
-    target = int(target_rotation) % 360
-    if target % 90 != 0:
-        target = (round(target / 90) * 90) % 360
-    current = int(app.config.get('IMAGE_ROTATION', 0)) % 360
-    if target == current:
-        return
-    img = app.config.get('IMAGE')
-    if img is None:
-        app.config['IMAGE_ROTATION'] = target
-        return
-    delta = (target - current) % 360
-    if delta:
-        rotated_img = rotate_bgr_image(img, delta)
-        app.config['IMAGE'] = rotated_img
-        raw_mask = app.config.get('RAW_MASK')
-        if isinstance(raw_mask, np.ndarray):
-            app.config['RAW_MASK'] = rotate_bgr_image(raw_mask, delta)
-        app.config['IMAGE_BASE_SHAPE'] = (int(rotated_img.shape[0]), int(rotated_img.shape[1]))
-    app.config['IMAGE_ROTATION'] = target
-
-
-
-
-def get_hqsam_predictor(checkpoint: str, model_type: str, force_device: Optional[str] = None):
-    """Load and cache a predictor for SAM/HQ-SAM. Tries HQ-SAM, then base SAM."""
-    if not checkpoint:
-        raise RuntimeError('Missing HQ-SAM checkpoint path')
-    device_pref = force_device or app.config.get('HQSAM_FORCE_DEVICE')
-    cache = app.config.setdefault('HQSAM_CACHE', {})
-    # Select device
-    try:
-        import torch  # type: ignore
-        if device_pref:
-            device = device_pref
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            device = 'mps'
-        elif torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
-    except Exception:
-        device = 'cpu'
-
-    key = (checkpoint, model_type, device)
-    if key in cache:
-        return cache[key]
-
-    predictor = None
-    # Try HQ-SAM
-    try:
-        try:
-            from segment_anything_hq import sam_model_registry as hq_registry  # type: ignore
-            from segment_anything_hq import SamHQImagePredictor as HQPred  # type: ignore
-            build_fn = hq_registry[model_type]
-            try:
-                sam = build_fn(checkpoint=None)
-            except TypeError:
-                sam = build_fn()
-            import torch  # type: ignore
-            state = torch.load(checkpoint, map_location='cpu')
-            if isinstance(state, dict) and 'state_dict' in state:
-                state = state['state_dict']
-            try:
-                sam.load_state_dict(state, strict=True)
-            except Exception:
-                sam.load_state_dict(state, strict=False)
-        except Exception:
-            from segment_anything_hq.build_sam_hq import build_sam_hq  # type: ignore
-            from segment_anything_hq.sam_hq_image_predictor import SamHQImagePredictor as HQPred  # type: ignore
-            sam = build_sam_hq(model_type, checkpoint, device='cpu')
-        try:
-            sam.to(device)
-        except Exception:
-            pass
-        predictor = HQPred(sam)
-    except Exception:
-        predictor = None
-
-    # Fallback: base SAM
-    if predictor is None:
-        try:
-            from segment_anything import sam_model_registry, SamPredictor  # type: ignore
-            sam = sam_model_registry[model_type](checkpoint=checkpoint)
-            try:
-                sam.to(device)
-            except Exception:
-                pass
-            predictor = SamPredictor(sam)
-        except Exception:
-            raise RuntimeError('HQ-SAM/SAM not available. Check your environment and checkpoint path.')
-
-    setattr(predictor, '_tc_device', device)
-    cache[key] = predictor
-    return predictor
-
-
-
-
-def _call_to_svg_compat(contours, hierarchy, out_path, mm_per_px, margin_mm, include_holes, sort_desc, stroke_width_mm: float):
-    """Call core.to_svg with backward compatibility.
-    Newer versions accept stroke_only and stroke_width; older ones don't.
-    """
-    try:
-        return core.to_svg(
-            contours,
-            hierarchy,
-            out_path,
-            mm_per_px,
-            margin_mm,
-            include_holes,
-            sort_desc,
-            stroke_only=True,
-            stroke_width=stroke_width_mm,
-        )
-    except TypeError:
-        # Fall back to older signature without styling args
-        return core.to_svg(
-            contours,
-            hierarchy,
-            out_path,
-            mm_per_px,
-            margin_mm,
-            include_holes,
-            sort_desc,
-        )
-# Fallbacks if tool_image_to_svg is missing newer helpers
-def _local_detect_quarter_ellipse(img_bgr: np.ndarray):
-    import math as _math
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    try:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
-    except Exception:
-        pass
-    g = cv2.GaussianBlur(gray, (5, 5), 0)
-    h, w = gray.shape[:2]
-    minR = max(8, int(min(h, w) * 0.015))
-    maxR = int(min(h, w) * 0.25)
-    def refine_in_roi(x: int, y: int, r: int):
-        x0 = max(0, x - int(1.5 * r)); x1 = min(w, x + int(1.5 * r))
-        y0 = max(0, y - int(1.5 * r)); y1 = min(h, y + int(1.5 * r))
-        roi = gray[y0:y1, x0:x1]
-        med = float(np.median(roi))
-        lo = int(max(0, 0.66 * med)); hi = int(min(255, 1.33 * med + 30))
-        edges = cv2.Canny(roi, lo, hi)
-        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not cnts:
-            return None
-        cxr = x - x0; cyr = y - y0
-        best = None; best_score = -1.0
-        for c in cnts:
-            if len(c) < 5:
-                continue
-            area = cv2.contourArea(c)
-            if area < 50:
-                continue
-            peri = cv2.arcLength(c, True)
-            if peri <= 0:
-                continue
-            circ = 4 * _math.pi * (area / (peri * peri))
-            (ecx, ecy), (MA, ma), angle = cv2.fitEllipse(c)
-            if MA <= 0 or ma <= 0:
-                continue
-            axis_ratio = MA / ma if MA >= ma else ma / MA
-            ratio_penalty = abs(1.0 - (1.0 / axis_ratio))
-            pts = c.reshape(-1, 2)
-            d2 = np.min((pts[:, 0] - cxr) ** 2 + (pts[:, 1] - cyr) ** 2)
-            center_bonus = 1.0 / (1.0 + d2)
-            score = float(circ - 0.5 * ratio_penalty + 0.2 * center_bonus)
-            if score > best_score:
-                best_score = score
-                best = (ecx + x0, ecy + y0, MA, ma, angle)
-        if best is None:
-            return None
-        cxo, cyo, MA, ma, angle = best
-        axis_ratio = MA / ma if MA >= ma else ma / MA
-        score = max(0.0, 1.0 - abs(1.0 - (1.0 / axis_ratio)))
-        return (score, float(cxo), float(cyo), float(MA), float(ma), float(angle))
-    best_candidate = None
-    for dp in (1.2, 1.4):
-        for p2 in (20, 30, 40):
-            try:
-                circles = cv2.HoughCircles(g, cv2.HOUGH_GRADIENT, dp=dp, minDist=min(h, w) // 6,
-                                           param1=120, param2=p2, minRadius=minR, maxRadius=maxR)
-            except Exception:
-                circles = None
-            if circles is None:
-                continue
-            for (x, y, r) in np.round(circles[0, :]).astype(int):
-                cand = refine_in_roi(x, y, r)
-                if cand is None:
-                    continue
-                if (best_candidate is None) or (cand[0] > best_candidate[0]):
-                    best_candidate = cand
-    if best_candidate is not None:
-        _, cx, cy, MA, ma, angle = best_candidate
-        return float(cx), float(cy), float(MA), float(ma), float(angle)
-    med = float(np.median(g))
-    lo = int(max(0, 0.66 * med)); hi = int(min(255, 1.33 * med + 30))
-    edges = cv2.Canny(g, lo, hi)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    best = None; best_score = -1.0
-    import math as _m
-    for c in cnts:
-        if len(c) < 5:
-            continue
-        area = cv2.contourArea(c)
-        if area < 100:
-            continue
-        peri = cv2.arcLength(c, True)
-        if peri <= 0:
-            continue
-        circ = 4 * _m.pi * (area / (peri * peri))
-        (cx, cy), (MA, ma), angle = cv2.fitEllipse(c)
-        if MA <= 0 or ma <= 0:
-            continue
-        axis_ratio = MA / ma if MA >= ma else ma / MA
-        ratio_penalty = abs(1.0 - (1.0 / axis_ratio))
-        score = float(circ - 0.5 * ratio_penalty)
-        if score > best_score:
-            best_score = score
-            best = (cx, cy, MA, ma, angle)
-    if best is not None:
-        cx, cy, MA, ma, angle = best
-        return float(cx), float(cy), float(MA), float(ma), float(angle)
-    return None
-
-
-def _local_affine_rectify_ellipse_to_circle(cx: float, cy: float, MA: float, ma: float, angle_deg: float) -> np.ndarray:
-    import math as _m
-    a = MA / 2.0; b = ma / 2.0
-    if a <= 0 or b <= 0:
-        return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    R = (a + b) / 2.0
-    sx = R / a; sy = R / b
-    th = _m.radians(angle_deg)
-    c = _m.cos(th); s = _m.sin(th)
-    T = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
-    Rm = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
-    S = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], dtype=np.float64)
-    Rp = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]], dtype=np.float64)
-    Tb = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
-    M = Tb @ Rp @ S @ Rm @ T
-    return M[:2, :].astype(np.float32)
-
-
-def _refine_quarter_circle(img_bgr: np.ndarray, cx: float, cy: float, r_init: float):
-    try:
-        if not np.isfinite([cx, cy, r_init]).all() or r_init <= 2:
-            return cx, cy, r_init
-        h, w = img_bgr.shape[:2]
-        band = max(6.0, r_init * 0.15)
-        x0 = max(0, int(np.floor(cx - r_init - band)))
-        y0 = max(0, int(np.floor(cy - r_init - band)))
-        x1 = min(w, int(np.ceil(cx + r_init + band)))
-        y1 = min(h, int(np.ceil(cy + r_init + band)))
-        if x1 <= x0 or y1 <= y0:
-            return cx, cy, r_init
-        roi = img_bgr[y0:y1, x0:x1]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        med = float(np.median(gray))
-        lo = int(max(0, 0.66 * med))
-        hi = int(min(255, 1.33 * med + 30))
-        edges = cv2.Canny(gray, lo, hi)
-        ys, xs = np.nonzero(edges)
-        if len(xs) < 50:
-            return cx, cy, r_init
-        xs = xs.astype(np.float64) + x0
-        ys = ys.astype(np.float64) + y0
-        d = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
-        mask = np.abs(d - r_init) <= band
-        xs = xs[mask]; ys = ys[mask]
-        if xs.size < 30:
-            return cx, cy, r_init
-        if xs.size > 4000:
-            import numpy as _np
-            idx = _np.random.choice(xs.size, 4000, replace=False)
-            xs = xs[idx]; ys = ys[idx]
-        A = np.column_stack([xs, ys, np.ones_like(xs)])
-        b = -(xs**2 + ys**2)
-        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-        Aco, Bco, Cco = sol
-        cx2 = -Aco / 2.0
-        cy2 = -Bco / 2.0
-        r2 = float(np.sqrt(max(1e-6, (Aco*Aco + Bco*Bco) / 4.0 - Cco)))
-        d2 = np.sqrt((xs - cx2) ** 2 + (ys - cy2) ** 2)
-        resid = np.abs(d2 - r2)
-        medr = float(np.median(resid))
-        thr = max(2.0, 2.5 * medr)
-        inl = resid <= thr
-        if inl.sum() >= 25 and inl.sum() >= xs.size * 0.3:
-            xs2 = xs[inl]; ys2 = ys[inl]
-            A = np.column_stack([xs2, ys2, np.ones_like(xs2)])
-            b = -(xs2**2 + ys2**2)
-            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-            Aco, Bco, Cco = sol
-            cx2 = -Aco / 2.0
-            cy2 = -Bco / 2.0
-            r2 = float(np.sqrt(max(1e-6, (Aco*Aco + Bco*Bco) / 4.0 - Cco)))
-        if abs(r2 - r_init) > max(8.0, 0.35 * r_init):
-            return cx, cy, r_init
-        return float(cx2), float(cy2), float(r2)
-    except Exception:
-        return cx, cy, r_init
-
-def rectify_by_quarter_if_requested(
-    img: np.ndarray,
-    use_quarter: bool,
-    quarter_mm: float,
-    quarter_roi: Optional[Dict[str, int]] = None,
-    quarter_manual: Optional[Dict[str, float]] = None,
-) -> Tuple[np.ndarray, Optional[float], Optional[Dict[str, float]]]:
-    if not use_quarter:
-        return img, None, None
-    # If user provided a manual ellipse, prefer it
-    if isinstance(quarter_manual, dict):
-        try:
-            cx = float(quarter_manual.get('cx'))
-            cy = float(quarter_manual.get('cy'))
-            MA = float(quarter_manual.get('MA'))
-            ma = float(quarter_manual.get('ma'))
-            angle = float(quarter_manual.get('angle', 0.0))
-            a = MA / 2.0; b = ma / 2.0; R0 = (a + b) / 2.0
-            cxr, cyr, Rr = _refine_quarter_circle(img, float(cx), float(cy), float(R0))
-            R = Rr if Rr > 0 else R0
-            mm_per_px = quarter_mm / (2.0 * R) if R > 0 else None
-            vis = {"cx": float(cxr), "cy": float(cyr), "r": float(R)}
-            return img, mm_per_px, vis
-        except Exception:
-            pass
-    H, W = img.shape[:2]
-    max_dim = max(H, W)
-    det_cap = 1200
-    sf = 1.0
-    det_img = img
-    if max_dim > det_cap:
-        sf = det_cap / float(max_dim)
-        det_img = cv2.resize(img, (int(W * sf), int(H * sf)), interpolation=cv2.INTER_AREA)
-    # ROI-guided detection if provided
-    det_for_search = det_img
-    roi_off_x = 0
-    roi_off_y = 0
-    if isinstance(quarter_roi, dict):
-        try:
-            x0 = int(max(0, quarter_roi.get('x0', 0)))
-            y0 = int(max(0, quarter_roi.get('y0', 0)))
-            x1 = int(quarter_roi.get('x1', W))
-            y1 = int(quarter_roi.get('y1', H))
-            if x1 < x0:
-                x0, x1 = x1, x0
-            if y1 < y0:
-                y0, y1 = y1, y0
-            if sf != 1.0:
-                x0 = int(round(x0 * sf)); y0 = int(round(y0 * sf))
-                x1 = int(round(x1 * sf)); y1 = int(round(y1 * sf))
-            x0 = max(0, min(x0, det_img.shape[1] - 1))
-            y0 = max(0, min(y0, det_img.shape[0] - 1))
-            x1 = max(x0 + 1, min(x1, det_img.shape[1]))
-            y1 = max(y0 + 1, min(y1, det_img.shape[0]))
-            det_for_search = det_img[y0:y1, x0:x1]
-            roi_off_x, roi_off_y = x0, y0
-        except Exception:
-            pass
-    detect_fn = getattr(core, 'detect_quarter_ellipse', None)
-    if detect_fn is None:
-        detect_fn = _local_detect_quarter_ellipse
-    ellipse = detect_fn(det_for_search)
-    if ellipse is None and det_for_search is not det_img:
-        roi_off_x = 0; roi_off_y = 0
-        ellipse = detect_fn(det_img)
-    if ellipse is None:
-        return img, None, None
-    cx, cy, MA, ma, angle = ellipse
-    # Account for ROI offset and scale back to original coords
-    cx += roi_off_x; cy += roi_off_y
-    if sf != 1.0:
-        inv = 1.0 / sf
-        cx *= inv; cy *= inv; MA *= inv; ma *= inv
-    # Compute scale from average radius and refine with edges
-    a = MA / 2.0; b = ma / 2.0; R0 = (a + b) / 2.0
-    cxr, cyr, Rr = _refine_quarter_circle(img, float(cx), float(cy), float(R0))
-    cx, cy, R = cxr, cyr, Rr
-    mm_per_px = quarter_mm / (2.0 * R) if R > 0 else None
-    vis = {"cx": float(cx), "cy": float(cy), "r": float(R)}
-    return img, mm_per_px, vis
-
-
-@app.route('/')
-def index():
-    return INDEX_HTML
-
-
-@app.post('/api/preview')
-def api_preview():
-    data = request.json or {}
-    desired_rotation = int(data.get('image_rotation', app.config.get('IMAGE_ROTATION', 0)))
-    _ensure_image_orientation(desired_rotation)
-    data = dict(data)
-    data['image_rotation'] = int(app.config.get('IMAGE_ROTATION', 0))
-    img = app.config.get('IMAGE')
-    if img is None:
-        # Placeholder prompting upload
-        H, W = 600, 900
-        overlay = np.full((H, W, 3), 245, dtype=np.uint8)
-        try:
-            cv2.putText(overlay, 'Drop an image here or click Upload', (36, H//2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (60,60,60), 2, cv2.LINE_AA)
-        except Exception:
-            pass
-        mask_bgr = np.zeros_like(overlay)
-        stats = {'contour_count': 0, 'total_area_px2': 0.0}
-        overlay_b64 = png_bytes_to_b64uri(bgr_to_png_bytes(overlay))
-        mask_b64 = png_bytes_to_b64uri(bgr_to_png_bytes(mask_bgr))
-        return jsonify({'overlay_png': overlay_b64, 'mask_png': mask_b64, 'stats': stats, 'scale_down': 1.0})
-    try:
-        overlay, mask_bgr, sstats = run_hqsam_preview(img, data)
-    except Exception as e:  # noqa: BLE001
-        return jsonify({'error': f'Preview failed: {e}'}), 400
-    # Derive stats from mask
-    mask = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2GRAY)
-    contours, hierarchy = cv2.findContours((mask > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    total_area = float(sum(cv2.contourArea(c) for c in contours))
-    stats = {'contour_count': int(len(contours)), 'total_area_px2': total_area}
-    # Build kept contours for SVG
-    kept = []
-    epsilon_frac = 0.002
-    min_area = 350.0
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        eps = max(1.0, epsilon_frac * peri)
-        ap = cv2.approxPolyDP(cnt, eps, True)
-        if len(ap) >= 3 and cv2.contourArea(ap) >= min_area:
-            kept.append(ap)
-    # Generate inline SVG preview
-    svg_data_uri = None
-    if kept:
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            mm_per_px = (sstats or {}).get('mm_per_px')
-            margin_mm = 5.0
-            stroke_mm = 1.4
-            if mm_per_px is None:
-                px_per_mm = 3.7795275591
-                stroke_width = stroke_mm * px_per_mm
-            else:
-                stroke_width = stroke_mm
-            include_holes = False
-            sort_desc = True
-            _call_to_svg_compat(kept, hierarchy, tmp_path, mm_per_px, margin_mm, include_holes, sort_desc, stroke_width)
-            with open(tmp_path, 'rb') as f:
-                svg_bytes = f.read()
-            svg_b64 = base64.b64encode(svg_bytes).decode('ascii')
-            svg_data_uri = f"data:image/svg+xml;base64,{svg_b64}"
-        finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    # Resize preview if large
-    max_w = 1000
-    scale = 1.0
-    if overlay.shape[1] > max_w:
-        scale = max_w / overlay.shape[1]
-        overlay = cv2.resize(overlay, (int(overlay.shape[1] * scale), int(overlay.shape[0] * scale)))
-        mask_bgr = cv2.resize(mask_bgr, (overlay.shape[1], overlay.shape[0]))
-
-    overlay_b64 = png_bytes_to_b64uri(bgr_to_png_bytes(overlay))
-    mask_b64 = png_bytes_to_b64uri(bgr_to_png_bytes(mask_bgr))
-    resp = {
-        'overlay_png': overlay_b64,
-        'mask_png': mask_b64,
-        'stats': stats,
-        'scale_down': scale,
+def _tool_result(s, tool_id: str, mask: np.ndarray, points: List[Dict], box: Optional[List[float]] = None) -> Dict:
+    poly = geometry.mask_to_polygon(mask)
+    area_px = float(mask.sum())
+    res: Dict[str, Any] = {
+        "id": tool_id,
+        "session_id": s.id,
+        "points": points,
+        "box": box,
+        "polygon_px": poly.tolist() if poly is not None else [],
+        "polygon_mm": (poly * s.mm_per_px).tolist() if poly is not None else [],
+        "area_mm2": area_px * (s.mm_per_px ** 2),
+        "measured_thickness_mm": None,
+        "height_stats": None,
     }
-    if svg_data_uri is not None:
-        resp['svg_data_uri'] = svg_data_uri
-    return jsonify(resp)
+    if poly is not None:
+        xs, ys = poly[:, 0], poly[:, 1]
+        res["bbox_px"] = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    if s.rect_height is not None and mask.any():
+        stats = scanmod.measure_thickness(s.rect_height, mask)
+        res["height_stats"] = stats
+        if stats:
+            res["measured_thickness_mm"] = round(stats["p95_mm"], 1)
+    s.masks[tool_id] = mask
+    return res
 
 
-@app.post('/api/upload_image')
-def api_upload_image():
-    try:
-        f = request.files.get('image')
-        if f is None:
-            return jsonify({'error': 'No file part named "image"'}), 400
-        data = f.read()
-        if not data:
-            return jsonify({'error': 'Empty file'}), 400
-        img, converted = decode_image_bytes_to_bgr(data)
-        if img is None:
-            return jsonify({'error': 'Unsupported image format'}), 400
-        auto_rotation = 0
+def _sam_mask(s, points: List[Dict], box: Optional[List[float]], hq_token_only: bool) -> np.ndarray:
+    SEGMENTER.set_image(f"{s.id}:{s.version}", s.rectified)
+    coords = [(p["x"], p["y"]) for p in points] or None
+    labels = [p["label"] for p in points] or None
+    mask = SEGMENTER.predict(coords, labels, box=box, hq_token_only=hq_token_only)
+    positives = [(p["x"], p["y"]) for p in points if p["label"] == 1]
+    min_area_px = 20.0 / (s.mm_per_px ** 2)
+    return clean_mask(mask, positives, min_area_px=min_area_px, fill_holes=True)
+
+
+# ----------------------------------------------------------------------------- routes
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "model": SEGMENTER.info(), "time": time.time()})
+
+
+@app.post("/api/sessions")
+def create_session():
+    f = request.files.get("file") or request.files.get("image")
+    if f is None:
+        raise ApiError('Send the upload as multipart field "file"')
+    data = f.read()
+    if not data:
+        raise ApiError("Empty upload")
+    filename = f.filename or "upload"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    units = (request.form.get("units") or "auto").lower()
+    scan_kind = (request.form.get("scan_kind") or "auto").lower()   # auto | layout | object
+    extra_tools: List[Dict] = []
+    if ext in MESH_EXTENSIONS:
         try:
-            if img.shape[1] < img.shape[0]:
-                img = rotate_bgr_image(img, 90)
-                auto_rotation = 90
-        except Exception:
-            auto_rotation = 0
-        app.config['IMAGE'] = img
-        app.config['IMAGE_BASE_SHAPE'] = (int(img.shape[0]), int(img.shape[1]))
-        app.config['IMAGE_ROTATION'] = auto_rotation
-        app.config.pop('RAW_MASK', None)
-        resp: Dict[str, Any] = {
-            'ok': True,
-            'shape': [int(img.shape[0]), int(img.shape[1])],
-            'auto_rotation_deg': auto_rotation,
-        }
-        if converted:
-            resp['converted_to'] = 'jpg'
-        return jsonify(resp), 200
-    except Exception as e:
-        return jsonify({'error': f'Upload failed: {e}'}), 400
-
-@app.post('/api/export_svg')
-def api_export_svg():
-    data = request.json or {}
-    desired_rotation = int(data.get('image_rotation', app.config.get('IMAGE_ROTATION', 0)))
-    _ensure_image_orientation(desired_rotation)
-    data = dict(data)
-    data['image_rotation'] = int(app.config.get('IMAGE_ROTATION', 0))
-    img = app.config.get('IMAGE')
-    if img is None:
-        return jsonify({'error': 'No image loaded. Upload or drop an image first.'}), 400
-    try:
-        export_data = dict(data)
-        export_data['compute_mask'] = True
-        overlay, mask_bgr, sstats = run_hqsam_preview(img, export_data)
-    except Exception as e:  # noqa: BLE001
-        return jsonify({'error': f'Export failed: {e}'}), 400
-    # Build contours from mask_bgr
-    mask = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2GRAY)
-    contours, hierarchy = cv2.findContours((mask > 0).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    kept = []
-    epsilon_frac = 0.002
-    min_area = 350.0
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        eps = max(1.0, epsilon_frac * peri)
-        ap = cv2.approxPolyDP(cnt, eps, True)
-        if len(ap) >= 3 and cv2.contourArea(ap) >= min_area:
-            kept.append(ap)
-    if not kept:
-        return jsonify({'error': 'No contours found with current mask'}), 400
-    mm_per_px = (sstats or {}).get('mm_per_px')
-    with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        margin_mm = 5.0
-        stroke_mm = 1.4
-        if mm_per_px is None:
-            px_per_mm = 3.7795275591
-            stroke_width = stroke_mm * px_per_mm
+            pts, colors = scanmod._load_points(data, ext)
+            pts = pts[np.isfinite(pts).all(axis=1)]
+            scale = scanmod.UNIT_SCALE_TO_MM.get(units) if units != "auto" else scanmod._guess_unit_scale(pts)
+            inlier_frac = None
+            if scan_kind == "auto":
+                scan_kind, inlier_frac = scanmod.classify_scan(pts * (scale or 1.0))
+                log.info("Scan classified as %s (plane inliers %.2f)", scan_kind, inlier_frac)
+            if scan_kind == "object":
+                obj = scanmod.rasterize_object(data, ext, units=units, pts_colors=(pts, colors))
+            else:
+                raster = scanmod.rasterize_scan(data, ext, units=units, pts_colors=(pts, colors))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("scan rasterization failed")
+            raise ApiError(f"Could not process scan: {exc}")
+        if scan_kind == "object":
+            s = STORE.create(
+                source_kind="object", filename=filename, original=obj.color_bgr,
+                original_height=obj.height_mm, original_mm_per_px=obj.mm_per_px,
+                scan_meta={"plane_inlier_fraction": inlier_frac, "unit_scale": obj.unit_scale},
+                object_meta={"footprint_w_mm": obj.extent_mm[0], "footprint_h_mm": obj.extent_mm[1],
+                             "thickness_mm": obj.thickness_mm},
+            )
+            # a single tool: the raster is already a top-down metric view, no calibration needed
+            s.rectified = obj.color_bgr
+            s.rect_height = obj.height_mm
+            s.mm_per_px = obj.mm_per_px
+            s.version = 1
+            base = re.sub(r"\.[^.]+$", "", filename).strip() or "Tool"
+            tool = _tool_result(s, f"o{s.id}", obj.footprint, [], None)
+            tool["measured_thickness_mm"] = round(obj.thickness_mm, 1)
+            tool["name"] = base
+            extra_tools.append(tool)
         else:
-            stroke_width = stroke_mm
-        include_holes = False
-        sort_desc = True
-        _call_to_svg_compat(kept, hierarchy, tmp_path, mm_per_px, margin_mm, include_holes, sort_desc, stroke_width)
-        return send_file(tmp_path, mimetype='image/svg+xml', as_attachment=True, download_name='tool_cutouts.svg')
-    finally:
+            s = STORE.create(
+                source_kind="scan", filename=filename, original=raster.color_bgr,
+                original_height=raster.height_mm, original_frac=raster.above_frac, original_mm_per_px=raster.mm_per_px,
+                suggested_corners=raster.suggested_corners.tolist() if raster.suggested_corners is not None else None,
+                scan_meta={"plane_inlier_fraction": raster.plane_inlier_fraction, "unit_scale": raster.unit_scale,
+                           "coverage": float(raster.coverage.mean())},
+            )
+    else:
+        raise ApiError("Only 3D files are accepted: PLY, OBJ, STL, GLB/GLTF, OFF or XYZ. "
+                       "Scan the whole layout (mat + tools) or a single tool and export a mesh or point cloud.")
+    info = s.info()
+    info["model"] = SEGMENTER.info()
+    info["tools"] = extra_tools
+    return jsonify(info), 201
+
+
+@app.get("/api/sessions/<sid>")
+def get_session(sid: str):
+    s = _session(sid)
+    info = s.info()
+    info["model"] = SEGMENTER.info()
+    return jsonify(info)
+
+
+@app.get("/api/sessions/<sid>/image/<stage>")
+def get_image(sid: str, stage: str):
+    s = _session(sid)
+    if stage == "original":
+        img = s.original
+    elif stage == "rectified":
+        img = _require_rectified(s).rectified
+    elif stage == "height":
+        src = s.rect_height if s.rectified is not None else s.original_height
+        if src is None:
+            raise ApiError("This session has no height data.", 404)
+        img = height_to_colormap(src)
+    elif stage == "height_original":
+        if s.original_height is None:
+            raise ApiError("No height data", 404)
+        img = height_to_colormap(s.original_height)
+    else:
+        raise ApiError("stage must be original | rectified | height", 404)
+    small, _ = downscale_to(img, DISPLAY_MAX_SIDE)
+    resp = Response(encode_jpeg(small, 86), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/api/sessions/<sid>/calibrate")
+def calibrate(sid: str):
+    s = _session(sid)
+    if s.source_kind == "object":
+        raise ApiError("This upload is a single tool model; it is already to scale and needs no calibration.")
+    body = request.get_json(force=True, silent=True) or {}
+    corners = body.get("corners")
+    if not corners or len(corners) != 4:
+        raise ApiError("corners must be 4 [x, y] points in original-image pixels")
+    try:
+        pts = [[float(c[0]), float(c[1])] for c in corners]
+    except (TypeError, ValueError, IndexError):
+        raise ApiError("corners must be 4 [x, y] points")
+    ordered = calibration.order_corners(pts)
+    # quarter turns clockwise: lets the user pick which physical corner becomes top-left
+    turns = int(body.get("rotate_quarter_turns", 0) or 0) % 4
+    if turns:
+        ordered = np.roll(ordered, turns, axis=0)
+    width_mm = _f(body, "width_mm")
+    height_mm = _f(body, "height_mm")
+    if s.source_kind == "scan" and (not width_mm or not height_mm):
+        # metric raster: measure the rectangle
+        hpx, vpx = calibration.edge_lengths_px(ordered)
+        width_mm = width_mm or hpx * s.original_mm_per_px
+        height_mm = height_mm or vpx * s.original_mm_per_px
+    if not width_mm or not height_mm or width_mm <= 0 or height_mm <= 0:
+        raise ApiError("width_mm and height_mm (real size of the mat / drawer) are required")
+    extra = [s.original_height, s.original_frac] if s.original_height is not None else None
+    warped, mm_per_px, H, extras = calibration.rectify(s.original, ordered, width_mm, height_mm, extra=extra,
+                                                       already_ordered=True)
+    s.rectified = warped
+    s.rect_height = extras[0] if extras else None
+    s.rect_frac = extras[1] if extras and len(extras) > 1 else None
+    s.mm_per_px = mm_per_px
+    s.mat_mm = (float(width_mm), float(height_mm))
+    s.corners = ordered.tolist()
+    s.homography = H
+    s.version += 1
+    s.masks.clear()
+    info = s.info()
+    info["model"] = SEGMENTER.info()
+    return jsonify(info)
+
+
+@app.post("/api/sessions/<sid>/auto_detect")
+def auto_detect(sid: str):
+    s = _require_rectified(_session(sid))
+    body = request.get_json(force=True, silent=True) or {}
+    mode = body.get("mode", "auto")
+    min_area_mm2 = _f(body, "min_area_mm2", 200.0) or 200.0
+    thr_mm = _f(body, "height_threshold_mm", 2.0) or 2.0
+    refine = bool(body.get("refine_with_sam", s.rect_height is None))
+    if mode == "auto":
+        mode = "height" if s.rect_height is not None else "color"
+    if mode == "height":
+        if s.rect_height is None:
+            raise ApiError("No height data; use mode 'color'")
+        fg, blobs = geometry.detect_blobs_height(s.rect_height, s.mm_per_px, threshold_mm=thr_mm,
+                                                 min_area_mm2=min_area_mm2, above_frac=s.rect_frac)
+    elif mode == "color":
+        fg, blobs = geometry.detect_blobs_color(s.rectified, s.mm_per_px, min_area_mm2=min_area_mm2)
+    else:
+        raise ApiError("mode must be auto | color | height")
+    blobs = blobs[:40]
+    tools = []
+    use_sam = refine and SEGMENTER.available
+    sam_error = None
+    if use_sam:
         try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+            SEGMENTER.set_image(f"{s.id}:{s.version}", s.rectified)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("SAM unavailable for auto-detect: %s", exc)
+            use_sam = False
+            sam_error = str(exc)
+    prefix = body.get("id_prefix") or f"t{int(time.time()) % 100000}_"
+    for i, b in enumerate(blobs):
+        tid = f"{prefix}{i + 1}"
+        points = [{"x": b["seed"][0], "y": b["seed"][1], "label": 1}]
+        box = [float(v) for v in b["box"]]
+        mask = b["mask"]
+        if use_sam:
+            try:
+                sam = _sam_mask(s, points, box, bool(body.get("hq_token_only", False)))
+                # guard against SAM grabbing the whole mat or losing the blob entirely
+                ratio = float(sam.sum()) / max(1.0, float(mask.sum()))
+                if 0.5 <= ratio <= 2.5:
+                    mask = sam
+            except Exception as exc:  # noqa: BLE001
+                log.warning("SAM refine failed for blob %d: %s", i, exc)
+        tools.append(_tool_result(s, tid, mask, points, box))
+    return jsonify({"tools": tools, "mode": mode, "sam_used": use_sam, "sam_error": sam_error,
+                    "foreground_fraction": float(fg.mean())})
+
+
+@app.post("/api/sessions/<sid>/segment")
+def segment(sid: str):
+    s = _require_rectified(_session(sid))
+    body = request.get_json(force=True, silent=True) or {}
+    tools_in = body.get("tools") or []
+    if not tools_in:
+        raise ApiError("tools[] with prompt points is required")
+    hq_token_only = bool(body.get("hq_token_only", False))
+    if not SEGMENTER.available:
+        raise ApiError("No HQ-SAM checkpoint on the server; click-to-segment is unavailable. Use auto-detect.", 503)
+    results = []
+    for t in tools_in:
+        tid = str(t.get("id") or f"t{len(results) + 1}")
+        points = _points(t.get("points"))
+        box = t.get("box")
+        if box is not None:
+            try:
+                box = [float(v) for v in box]
+            except (TypeError, ValueError):
+                raise ApiError("box must be [x0, y0, x1, y1]")
+        if not points and box is None:
+            results.append({"id": tid, "points": [], "box": None, "polygon_px": [], "area_mm2": 0.0,
+                            "measured_thickness_mm": None, "height_stats": None})
+            continue
+        if not any(p["label"] == 1 for p in points) and box is None:
+            raise ApiError(f"Tool {tid} needs at least one positive point")
+        mask = _sam_mask(s, points, box, hq_token_only)
+        results.append(_tool_result(s, tid, mask, points, box))
+    return jsonify({"tools": results})
+
+
+# ----------------------------------------------------------------------------- layout + export
+
+def _tool_polygon_mm(t: Dict) -> List[List[float]]:
+    """Tools carry mm polygons; older clients may send polygon_px + session_id instead."""
+    poly = t.get("polygon_mm")
+    if poly:
+        return poly
+    px = t.get("polygon_px") or []
+    sid = t.get("session_id")
+    sess = STORE.get(sid) if sid else None
+    if px and sess is not None and sess.mm_per_px:
+        return (np.asarray(px, dtype=np.float64) * sess.mm_per_px).tolist()
+    return []
+
+
+def _compute_layout(body: Dict) -> Dict:
+    mat = body.get("mat") or {}
+    width_mm = _f(mat, "width_mm")
+    height_mm = _f(mat, "height_mm")
+    if not width_mm or not height_mm:
+        raise ApiError("mat.width_mm and mat.height_mm are required")
+    smoothing = _f(body, "smoothing_mm", 0.6) or 0.0
+    simplify = _f(body, "simplify_mm", 0.15) or 0.15
+    default_clearance = _f(body, "default_clearance_mm", 1.0) or 0.0
+    mirror = bool(body.get("mirror", False))
+    tools_out = []
+    for t in body.get("tools") or []:
+        if not t.get("include", True):
+            continue
+        poly = _tool_polygon_mm(t)
+        if len(poly) < 3:
+            continue
+        off = t.get("offset_mm") or {}
+        notch = t.get("notch") or None
+        res = geometry.process_outline(
+            poly, 1.0,
+            rotation_deg=_f(t, "rotation_deg", 0.0) or 0.0,
+            offset_mm=(_f(off, "x", 0.0) or 0.0, _f(off, "y", 0.0) or 0.0),
+            clearance_mm=_f(t, "clearance_mm", default_clearance) if t.get("clearance_mm") is not None else default_clearance,
+            smoothing_mm=smoothing,
+            notch=notch,
+            simplify_mm=simplify,
+        )
+        depth = _f(t, "depth_mm", None)
+        entry = {
+            "id": str(t.get("id")),
+            "name": t.get("name") or str(t.get("id")),
+            "depth_mm": depth,
+            "raw": t,
+            "source_centroid_mm": res.get("source_centroid_mm"),
+            "rings": res["rings"],
+            "area_mm2": res["area_mm2"],
+            "bbox_mm": res["bbox_mm"],
+            "centroid_mm": res["centroid_mm"],
+            "notch": res.get("notch"),
+            "shapely": res.get("shapely"),
+        }
+        if mirror:
+            from shapely import affinity
+
+            entry["rings"] = geometry.mirror_rings(entry["rings"], width_mm)
+            if entry["centroid_mm"]:
+                entry["centroid_mm"] = [width_mm - entry["centroid_mm"][0], entry["centroid_mm"][1]]
+            if entry["bbox_mm"]:
+                b = entry["bbox_mm"]
+                entry["bbox_mm"] = [width_mm - b[2], b[1], width_mm - b[0], b[3]]
+            if entry["shapely"] is not None:
+                entry["shapely"] = affinity.scale(entry["shapely"], xfact=-1.0, origin=(width_mm / 2.0, 0))
+        tools_out.append(entry)
+    # flag overlaps and out-of-mat tools for the UI
+    from shapely.geometry import box as sbox
+
+    mat_poly = sbox(0, 0, width_mm, height_mm)
+    for i, a in enumerate(tools_out):
+        ga = a.get("shapely")
+        a["outside_mat"] = bool(ga is not None and not ga.is_empty and not mat_poly.contains(ga))
+        overlaps = []
+        for j, b in enumerate(tools_out):
+            if i == j:
+                continue
+            gb = b.get("shapely")
+            if ga is not None and gb is not None and not ga.is_empty and not gb.is_empty and ga.intersects(gb):
+                if ga.intersection(gb).area > 0.5:
+                    overlaps.append(b["id"])
+        a["overlaps"] = overlaps
+    return {"mat": {"width_mm": width_mm, "height_mm": height_mm}, "tools": tools_out, "mirror": mirror}
+
+
+def _strip_private(layout: Dict) -> Dict:
+    return {"mat": layout["mat"], "mirror": layout["mirror"],
+            "tools": [{k: v for k, v in t.items() if k not in ("shapely", "raw", "source_centroid_mm")} for t in layout["tools"]]}
+
+
+def _geometry_for_tool(raw: Dict):
+    """(mask, height raster, mm_per_px) for a tool whose upload is still in memory, else None."""
+    sid = raw.get("session_id")
+    sess = STORE.get(sid) if sid else None
+    if sess is None or sess.rect_height is None:
+        return None
+    mask = sess.masks.get(str(raw.get("id")))
+    if mask is None or mask.shape != sess.rect_height.shape:
+        return None
+    return mask, sess.rect_height, sess.mm_per_px
+
+
+@app.post("/api/layout")
+@app.post("/api/sessions/<sid>/layout")
+def layout(sid: Optional[str] = None):
+    body = request.get_json(force=True, silent=True) or {}
+    return jsonify(_strip_private(_compute_layout(body)))
+
+
+@app.post("/api/export")
+@app.post("/api/sessions/<sid>/export")
+def export(sid: Optional[str] = None):
+    body = request.get_json(force=True, silent=True) or {}
+    fmt = (body.get("format") or "svg").lower()
+    opts = body.get("export") or {}
+    lay = _compute_layout(body)
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", (opts.get("filename") or "tool_foam_layout")).strip("_") or "tool_foam_layout"
+    if fmt == "svg":
+        svg = layout_to_svg(lay, include_mat=bool(opts.get("include_mat", True)),
+                            include_labels=bool(opts.get("include_labels", True)),
+                            fill_mode=opts.get("fill_mode", "none"),
+                            stroke_mm=float(opts.get("stroke_mm", 0.2)))
+        return send_file(io.BytesIO(svg.encode("utf-8")), mimetype="image/svg+xml", as_attachment=True,
+                         download_name=f"{base}.svg")
+    if fmt == "dxf":
+        data = layout_to_dxf(lay, include_mat=bool(opts.get("include_mat", True)),
+                             include_labels=bool(opts.get("include_labels", True)))
+        return send_file(io.BytesIO(data), mimetype="application/dxf", as_attachment=True, download_name=f"{base}.dxf")
+    if fmt == "stl":
+        data = layout_to_stl(lay, mat_thickness_mm=float(opts.get("mat_thickness_mm", 30.0)),
+                             floor_min_mm=float(opts.get("floor_min_mm", 2.0)))
+        inline = bool(body.get("inline", False))
+        return send_file(io.BytesIO(data), mimetype="model/stl", as_attachment=not inline, download_name=f"{base}.stl")
+    if fmt == "stl_tools":
+        # the tools themselves as 3D bodies sitting in their pockets (for the assembled preview)
+        data = layout_tools_to_stl(lay, mat_thickness_mm=float(opts.get("mat_thickness_mm", 30.0)),
+                                   geometry_for_tool=_geometry_for_tool)
+        inline = bool(body.get("inline", False))
+        return send_file(io.BytesIO(data), mimetype="model/stl", as_attachment=not inline, download_name=f"{base}_tools.stl")
+    raise ApiError("format must be svg | dxf | stl | stl_tools")
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Run the ToolCutter segmentation API server')
-    ap.add_argument('--image', '-i', required=False, default=None, help='Path to overhead tool image (optional)')
-    ap.add_argument('--host', default='127.0.0.1')
-    ap.add_argument('--port', type=int, default=8000)
-    ap.add_argument('--debug', action='store_true')
+    ap = argparse.ArgumentParser(description="ToolCutter API server")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--preload", action="store_true", help="Load the HQ-SAM model at startup")
     args = ap.parse_args()
-
-    if args.image:
-        try:
-            img, converted = load_image_from_path(args.image)
-        except RuntimeError as exc:
-            raise SystemExit(str(exc))
-        app.config['IMAGE'] = img
-        if converted:
-            app.logger.info('Converted %s to JPEG for processing', args.image)
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    log.info("Model: %s", SEGMENTER.info())
+    if args.preload and SEGMENTER.available:
+        SEGMENTER.ensure_loaded()
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 
-def run_hqsam_preview(base_img: np.ndarray, data: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    rotation = int(data.get('image_rotation', app.config.get('IMAGE_ROTATION', 0))) % 360
-    working_img = base_img.copy()
-
-    use_quarter = bool(data.get('use_quarter', False))
-    quarter_mm = float(data.get('quarter_diameter_mm', 24.26))
-    quarter_roi = data.get('quarter_roi') if isinstance(data.get('quarter_roi'), dict) else None
-    quarter_manual = data.get('quarter_manual') if isinstance(data.get('quarter_manual'), dict) else None
-    img, mm_per_px, vis = rectify_by_quarter_if_requested(working_img, use_quarter, quarter_mm, quarter_roi, quarter_manual)
-    full_frame = img.copy()  # keep reference to the rectified image before any cropping
-    crop_bounds: Optional[Tuple[int, int, int, int]] = None
-
-    # Optional crop
-    crop_rect = data.get('crop_rect')
-    if isinstance(crop_rect, dict):
-        try:
-            x0 = int(max(0, crop_rect.get('x0', 0)))
-            y0 = int(max(0, crop_rect.get('y0', 0)))
-            x1 = int(crop_rect.get('x1', img.shape[1]))
-            y1 = int(crop_rect.get('y1', img.shape[0]))
-            if x1 < x0:
-                x0, x1 = x1, x0
-            if y1 < y0:
-                y0, y1 = y1, y0
-            x0 = max(0, min(x0, img.shape[1] - 1))
-            y0 = max(0, min(y0, img.shape[0] - 1))
-            x1 = max(x0 + 1, min(x1, img.shape[1]))
-            y1 = max(y0 + 1, min(y1, img.shape[0]))
-            crop_bounds = (x0, y0, x1, y1)
-            img = img[y0:y1, x0:x1].copy()
-            if vis is not None:
-                vis = {"cx": float(vis["cx"]) - float(x0), "cy": float(vis["cy"]) - float(y0), "r": float(vis.get("r", 0.0))}
-        except Exception:
-            pass
-
-    compute = bool(data.get('compute_mask', True))
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    if not compute:
-        raw_prev = app.config.get('RAW_MASK')
-        if isinstance(raw_prev, np.ndarray) and raw_prev.shape[:2] == img.shape[:2]:
-            mask = raw_prev.copy()
-    if compute:
-        ckpt = data.get('hqsam_checkpoint', '')
-        model_type = data.get('hqsam_model_type', 'vit_h')
-        if not ckpt:
-            ckpt = os.environ.get('HQSAM_CKPT', '') or '/Users/NolanMorrow/Programming/ToolCutter/backend/sam_hq_vit_h.pth'
-
-        H0, W0 = img.shape[:2]
-        max_side = float(data.get('sam_max_side', 640.0))
-        max_side = max(512.0, min(max_side, 2048.0))
-        scale_factor = 1.0
-        work_img = img
-        if max(H0, W0) > max_side:
-            scale_factor = max_side / float(max(H0, W0))
-            new_w = max(1, int(round(W0 * scale_factor)))
-            new_h = max(1, int(round(H0 * scale_factor)))
-            work_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-        img_rgb = cv2.cvtColor(work_img, cv2.COLOR_BGR2RGB)
-
-        def infer_with_predictor(pred) -> np.ndarray:
-            try:
-                import torch  # type: ignore
-                ctx = torch.inference_mode
-            except Exception:
-                ctx = None
-            context = ctx() if callable(ctx) else nullcontext()
-            with context:
-                pred.set_image(img_rgb)
-                points = data.get('sam_points', [])
-                sam_auto = bool(data.get('sam_auto', False))
-                local_mask = np.zeros(work_img.shape[:2], dtype=np.uint8)
-                if points:
-                    pts = np.array([[p['x'], p['y']] for p in points], dtype=np.float32)
-                    if scale_factor != 1.0:
-                        pts *= scale_factor
-                    labs = np.array([1 if str(p.get('label','pos'))=='pos' else 0 for p in points], dtype=np.int32)
-                    multimask = bool(data.get('sam_multimask', True))
-                    union_masks = bool(data.get('sam_union', True))
-                    masks, scores, _ = pred.predict(point_coords=pts, point_labels=labs, multimask_output=multimask)
-                    if masks is not None and len(masks) > 0:
-                        if union_masks and multimask:
-                            local_mask = (np.any(masks > 0, axis=0)).astype(np.uint8) * 255
-                        else:
-                            k = int(np.argmax(scores)) if scores is not None else 0
-                            local_mask = (masks[k] > 0).astype(np.uint8) * 255
-                elif sam_auto:
-                    H, W = work_img.shape[:2]
-                    box = np.array([0, 0, W-1, H-1], dtype=np.float32)
-                    multimask = bool(data.get('sam_multimask', True))
-                    union_masks = bool(data.get('sam_union', True))
-                    try:
-                        masks, scores, _ = pred.predict(point_coords=None, point_labels=None, box=box, multimask_output=multimask)
-                    except TypeError:
-                        masks, scores, _ = pred.predict(point_coords=None, point_labels=None, box=box[None, :], multimask_output=multimask)
-                    if masks is not None and len(masks) > 0:
-                        if union_masks and multimask:
-                            local_mask = (np.any(masks > 0, axis=0)).astype(np.uint8) * 255
-                        else:
-                            k = int(np.argmax(scores)) if scores is not None else 0
-                            local_mask = (masks[k] > 0).astype(np.uint8) * 255
-                if scale_factor != 1.0 and local_mask.size:
-                    local_mask = cv2.resize(local_mask, (W0, H0), interpolation=cv2.INTER_NEAREST)
-                return local_mask
-
-        predictor = get_hqsam_predictor(ckpt, model_type)
-        try:
-            mask = infer_with_predictor(predictor)
-        except RuntimeError as exc:
-            msg = str(exc).lower()
-            retriable = any(token in msg for token in ('mps', 'metal', 'command buffer', 'outofmemory'))
-            if not retriable:
-                raise
-            # MPS occasionally runs out of memory on large crops; fall back to CPU for reliability.
-            app.logger.warning('HQ-SAM predictor on %s failed (%s). Retrying on CPU.', getattr(predictor, '_tc_device', 'unknown'), exc)
-            cache = app.config.get('HQSAM_CACHE', {})
-            pred_device = getattr(predictor, '_tc_device', None)
-            if pred_device is not None:
-                cache.pop((ckpt, model_type, pred_device), None)
-            predictor = get_hqsam_predictor(ckpt, model_type, force_device='cpu')
-            mask = infer_with_predictor(predictor)
-        app.config['RAW_MASK'] = mask.copy()
-        # Post-process (fixed defaults)
-        thr = 45
-        blur = 1
-        dil = 4
-        ero = 2
-        if blur > 0:
-            k = max(1, int(blur) * 2 + 1)
-            mask = cv2.GaussianBlur(mask, (k, k), 0)
-            _, mask = cv2.threshold(mask, thr, 255, cv2.THRESH_BINARY)
-        if dil > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil, dil))
-            mask = cv2.dilate(mask, k, iterations=1)
-        if ero > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ero, ero))
-            mask = cv2.erode(mask, k, iterations=1)
-
-    overlay = img.copy()
-    if np.any(mask > 0):
-        color = (0, 160, 255)
-        alpha = 0.5
-        color_img = np.zeros_like(overlay); color_img[:] = color
-        overlay = np.where((mask > 0)[..., None], (overlay * (1 - alpha) + color_img * alpha).astype(np.uint8), overlay)
-    if vis is not None:
-        cx_i, cy_i, rr = int(vis['cx']), int(vis['cy']), int(max(1, vis.get('r', 0)))
-        cv2.circle(overlay, (cx_i, cy_i), rr, (0, 255, 0), 3)
-        cv2.circle(overlay, (cx_i, cy_i), 3, (0, 255, 0), -1)
-        cv2.line(overlay, (cx_i - 12, cy_i), (cx_i + 12, cy_i), (0, 255, 0), 2)
-        cv2.line(overlay, (cx_i, cy_i - 12), (cx_i, cy_i + 12), (0, 255, 0), 2)
-        try:
-            cv2.putText(overlay, 'Quarter', (cx_i + rr + 8, max(15, cy_i - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        except Exception:
-            pass
-
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    if crop_bounds is not None:
-        x0, y0, x1, y1 = crop_bounds
-        base_overlay = full_frame.copy()
-        base_overlay[y0:y1, x0:x1] = overlay
-        overlay = base_overlay
-        full_mask = np.zeros_like(base_overlay)
-        full_mask[y0:y1, x0:x1] = mask_bgr
-        mask_bgr = full_mask
-        if vis is not None:
-            vis = {
-                "cx": float(vis["cx"]) + float(x0),
-                "cy": float(vis["cy"]) + float(y0),
-                "r": float(vis.get("r", 0.0)),
-            }
-
-    stats = {
-        'mm_per_px': mm_per_px,
-        'quarter_vis': vis,
-        'quarter_found': bool(vis is not None),
-        'image_rotation': rotation,
-    }
-    return overlay, mask_bgr, stats
-
-@app.get('/health')
-def health():
-    return jsonify({'status': 'ok'})
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

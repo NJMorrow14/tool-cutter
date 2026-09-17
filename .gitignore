@@ -52,3 +52,9 @@ Thumbs.db
 # Miscellaneous
 *.tmp
 *.temp
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Smoke-test outputs
+backend/tests/out/
