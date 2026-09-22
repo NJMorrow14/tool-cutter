@@ -19,13 +19,17 @@ interface Props {
   onSelect: (id: string | null) => void;
   /** committed after a drag: move the tool by (dx, dy) mm */
   onMove: (id: string, dx: number, dy: number) => void;
+  /** tools ticked for a group move / delete — drawn with an orange glow */
+  pickedIds?: string[];
+  /** Cmd/Ctrl/Shift-click on a tool body: add it to / remove it from the ticked set instead of grabbing it */
+  onPick?: (id: string) => void;
 }
 
 type ToolNode = { group: THREE.Group; body: THREE.Mesh; key: string };
 
 /** The foam block with the scanned tool bodies sitting in their pockets. Drag a tool to move it on the mat;
  *  the same keyboard nudges/rotation as the 2D sheet apply. Pockets come from the computed layout. */
-export default function Layout3D({ tools, layout, mat, settings, selectedId, onSelect, onMove }: Props) {
+export default function Layout3D({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [showTools, setShowTools] = useState(true);
@@ -34,8 +38,8 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
     foam: THREE.Mesh | null; pockets: THREE.Group; toolsGroup: THREE.Group; nodes: Map<string, ToolNode>; hfs: Map<string, Heightfield | null>;
     drag: { id: string; start: THREE.Vector3; delta: THREE.Vector3; moved: boolean } | null;
   } | null>(null);
-  const propsRef = useRef({ tools, layout, mat, settings, selectedId, onSelect, onMove });
-  propsRef.current = { tools, layout, mat, settings, selectedId, onSelect, onMove };
+  const propsRef = useRef({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick });
+  propsRef.current = { tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick };
 
   // ------------------------------------------------------------------ scene
   useEffect(() => {
@@ -77,6 +81,13 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
       if (e.button !== 0) return;
       const id = pickTool(e);
       if (!id) return;
+      // Cmd/Ctrl/Shift-click ticks the tool instead of grabbing it (Chrome on macOS turns Ctrl+click
+      // into a right-click, so Cmd is the gesture that actually lands here)
+      if ((e.metaKey || e.ctrlKey || e.shiftKey) && propsRef.current.onPick) {
+        controls.enabled = false;                       // do not orbit off a tick
+        propsRef.current.onPick(id);
+        return;
+      }
       const start = hitMat(e);
       if (!start) return;
       controls.enabled = false;
@@ -236,7 +247,7 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
   const placeAll = () => {
     const s = S.current;
     if (!s) return;
-    const { tools: ts, layout: lay, settings: st, selectedId: sel } = propsRef.current;
+    const { tools: ts, layout: lay, settings: st, selectedId: sel, pickedIds: picked } = propsRef.current;
     const T = st.mat_thickness_mm;
     for (const t of ts) {
       const node = s.nodes.get(t.id);
@@ -251,11 +262,12 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
       if (!(s.drag && s.drag.id === t.id)) node.group.position.set(c.x + t.offset_mm.x, c.y + t.offset_mm.y, -d);
       else node.group.position.z = -d;
       const m = node.body.material as THREE.MeshStandardMaterial;
-      m.emissive.set(t.id === sel ? 0x3b82f6 : 0x000000);
-      m.emissiveIntensity = t.id === sel ? 0.35 : 0;
+      const tick = !!picked?.includes(t.id);
+      m.emissive.set(tick ? 0xf26a1b : t.id === sel ? 0x3b82f6 : 0x000000);   // ticked (orange) wins over selected (blue)
+      m.emissiveIntensity = tick ? 0.5 : t.id === sel ? 0.35 : 0;
     }
   };
-  useEffect(() => { placeAll(); }, [tools, layout, settings, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { placeAll(); }, [tools, layout, settings, selectedId, pickedIds]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { const s = S.current; if (s) s.toolsGroup.visible = showTools; }, [showTools]);
 
   return (

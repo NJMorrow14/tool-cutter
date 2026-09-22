@@ -30,6 +30,10 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Tools ticked for a group move / delete. Kept apart from selectedId: one tool is being EDITED
+  // (its panel is open), several are being GATHERED. Ctrl/Cmd/Shift-click a row or a tool on the
+  // canvas toggles a tick; a plain click still single-selects.
+  const [pickedIds, setPickedIds] = useState<string[]>([]);
   const [notchMode, setNotchMode] = useState(false);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
@@ -86,6 +90,32 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
     updateTool(t.id, (x) => ({ ...x, shape: spec, polygon_mm: poly, area_mm2: polygonArea(poly), name: autoNamed ? shapeName(spec) : x.name }));
   };
 
+  // ------------------------------------------------------------------ multi-select (ticks)
+  const isPicked = (id: string) => pickedIds.includes(id);
+  const togglePick = (id: string) => setPickedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  /** true when the event carries the "add to the tick set" modifier (Cmd on macOS — Chrome turns Ctrl+click into a right-click there) */
+  const pickMod = (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => e.metaKey || e.ctrlKey || e.shiftKey;
+  const removeTools = (ids: string[]) => {
+    setTools((prev) => prev.filter((t) => !ids.includes(t.id)));
+    setPickedIds((prev) => prev.filter((id) => !ids.includes(id)));
+    if (selectedId && ids.includes(selectedId)) setSelectedId(null);
+  };
+  /** the tools a keyboard move/rotate applies to: the ticked set wins, otherwise the single selection */
+  const activeIds = pickedIds.length ? pickedIds : selected ? [selected.id] : [];
+  const nudgeIds = (ids: string[], dx: number, dy: number) =>
+    setTools((prev) => prev.map((t) => (ids.includes(t.id) ? { ...t, offset_mm: { x: t.offset_mm.x + dx, y: t.offset_mm.y + dy } } : t)));
+  const rotateIds = (ids: string[], deg: number) =>
+    setTools((prev) => prev.map((t) => (ids.includes(t.id) ? { ...t, rotation_deg: ((t.rotation_deg + deg) % 360 + 360) % 360 } : t)));
+  // a tool can disappear (auto layout never removes one, but a new capture replaces the list) — drop dead ticks
+  const toolIdKey = tools.map((t) => t.id).join('|');
+  useEffect(() => {
+    setPickedIds((prev) => {
+      const live = prev.filter((id) => tools.some((t) => t.id === id));
+      return live.length === prev.length ? prev : live;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolIdKey]);
+
   // ------------------------------------------------------------------ mm-space pointer math
   const margin = 6;
   const vb = { x: -margin, y: -margin, w: mat.width_mm + 2 * margin, h: mat.height_mm + 2 * margin };
@@ -128,6 +158,7 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
     if (e.button !== 0) return;
     if (drawTool) { onSheetDown(e); return; }          // drawing over an existing tool is allowed
     e.stopPropagation();
+    if (pickMod(e)) { togglePick(id); return; }        // Cmd/Ctrl/Shift-click ticks the tool instead of grabbing it
     setSelectedId(id);
     const p = toMm(e);
     if (notchMode) {
@@ -175,15 +206,18 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
       if (e.key === 'Backspace' && drawTool === 'poly' && polyPts.length) { setPolyPts(polyPts.slice(0, -1)); e.preventDefault(); return; }
       const toolKeys: Record<string, ShapeKind | null> = { v: null, '1': 'rect', '2': 'slot', '3': 'circle', '4': 'hex', '5': 'poly' };
       if (e.key.toLowerCase() in toolKeys && !e.metaKey && !e.ctrlKey) { setDrawTool(toolKeys[e.key.toLowerCase()]); setPolyPts([]); return; }
-      if (!selected) return;
+      // Escape clears the ticks first, so it does not also drop the tool being edited
+      if (e.key === 'Escape' && pickedIds.length) { setPickedIds([]); e.preventDefault(); return; }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && pickedIds.length) { removeTools(pickedIds); e.preventDefault(); return; }
+      const ids = activeIds;
+      if (!ids.length) return;
       const step = e.shiftKey ? 5 : 1;
-      const nudge = (dx: number, dy: number) => updateTool(selected.id, (t) => ({ ...t, offset_mm: { x: t.offset_mm.x + dx, y: t.offset_mm.y + dy } }));
-      if (e.key === 'ArrowLeft') nudge(-step, 0);
-      else if (e.key === 'ArrowRight') nudge(step, 0);
-      else if (e.key === 'ArrowUp') nudge(0, -step);
-      else if (e.key === 'ArrowDown') nudge(0, step);
-      else if (e.key.toLowerCase() === 'r') updateTool(selected.id, (t) => ({ ...t, rotation_deg: ((t.rotation_deg + (e.shiftKey ? -90 : 90)) % 360 + 360) % 360 }));
-      else if (e.key === '[' || e.key === ']') updateTool(selected.id, (t) => ({ ...t, rotation_deg: ((t.rotation_deg + (e.key === ']' ? 5 : -5)) % 360 + 360) % 360 }));
+      if (e.key === 'ArrowLeft') nudgeIds(ids, -step, 0);
+      else if (e.key === 'ArrowRight') nudgeIds(ids, step, 0);
+      else if (e.key === 'ArrowUp') nudgeIds(ids, 0, -step);
+      else if (e.key === 'ArrowDown') nudgeIds(ids, 0, step);
+      else if (e.key.toLowerCase() === 'r') rotateIds(ids, e.shiftKey ? -90 : 90);
+      else if (e.key === '[' || e.key === ']') rotateIds(ids, e.key === ']' ? 5 : -5);
       else if (e.key === 'Escape') setSelectedId(null);
       else return;
       e.preventDefault();
@@ -191,7 +225,7 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, drawTool, polyPts, drawThick]);
+  }, [selected, drawTool, polyPts, drawThick, pickedIds, tools]);
 
   // ------------------------------------------------------------------ auto layout
   const runAutoLayout = async () => {
@@ -307,9 +341,10 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
           {busy && <span className={ui.spinner} />}
           <span className={ui.hint}>{fmt(mat.width_mm, 1)} × {fmt(mat.height_mm, 1)} mm</span>
         </div>
-        <div className={ed.guidance}><div><strong>{drawTool ? `Draw a ${drawTool}` : notchMode ? 'Place a finger notch' : 'Arrange your tools'}</strong>{drawTool === 'poly' ? 'Click corners, then Enter to finish. Escape cancels.' : drawTool ? 'Drag across the sheet to size the pocket. Escape returns to Select.' : notchMode ? 'Click an outline where you want to lift the tool out.' : 'Drag a tool to position it, or use Auto layout to get started.'}</div><span>Arrow keys: nudge · R: rotate · Shift: larger steps</span></div>
+        <div className={ed.guidance}><div><strong>{drawTool ? `Draw a ${drawTool}` : notchMode ? 'Place a finger notch' : 'Arrange your tools'}</strong>{drawTool === 'poly' ? 'Click corners, then Enter to finish. Escape cancels.' : drawTool ? 'Drag across the sheet to size the pocket. Escape returns to Select.' : notchMode ? 'Click an outline where you want to lift the tool out.' : 'Drag a tool to position it, or use Auto layout to get started.'}</div><span>{pickedIds.length > 0 ? `${pickedIds.length} ticked · arrow keys move them together · Delete removes them · Escape clears` : 'Arrow keys: nudge · R: rotate · Shift: larger steps · Ctrl/Cmd-click: tick several'}</span></div>
         {view3d && (
           <Layout3D tools={tools} layout={layout} mat={mat} settings={settings} selectedId={selectedId} onSelect={setSelectedId}
+            pickedIds={pickedIds} onPick={togglePick}
             onMove={(id, dx, dy) => updateTool(id, (t) => ({
               ...t, offset_mm: { x: Math.round((t.offset_mm.x + dx) * 10) / 10, y: Math.round((t.offset_mm.y + dy) * 10) / 10 },
               notch: t.notch ? { ...t.notch, x_mm: t.notch.x_mm + dx, y_mm: t.notch.y_mm + dy } : null,
@@ -340,6 +375,7 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
                 onPointerDown={(e) => onToolDown(lt.id, e)}>
                 <path d={ringsToPath(lt.rings)} fill={tool.color} fillOpacity={sel ? 0.35 : 0.18} fillRule="evenodd"
                   stroke={bad ? '#dc2626' : color} strokeWidth={sel ? 0.9 : 0.5} strokeDasharray={bad ? '2 1' : undefined} strokeLinejoin="round" />
+                {isPicked(lt.id) && <path d={ringsToPath(lt.rings)} fill="none" fillRule="evenodd" stroke="#f26a1b" strokeWidth={1.3} strokeLinejoin="round" style={{ pointerEvents: 'none' }} />}
                 {lt.notch && <circle cx={lt.notch.x_mm} cy={lt.notch.y_mm} r={lt.notch.diameter_mm / 2} fill="none" stroke="#f59e0b" strokeWidth={0.4} strokeDasharray="1 1" />}
                 {lt.centroid_mm && settings.include_labels && (
                   <text x={lt.centroid_mm[0]} y={lt.centroid_mm[1]} fontSize={Math.max(3, Math.min(6, ((lt.bbox_mm?.[2] ?? 0) - (lt.bbox_mm?.[0] ?? 0)) / 12))}
@@ -466,15 +502,41 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
             </div>
             <input ref={fileRef} type="file" accept={MESH_ACCEPT} hidden onChange={(e) => { void importObject(e.target.files?.[0]); e.target.value = ''; }} />
           </div>
+          {pickedIds.length > 0 && (
+            <div className={ui.row} style={{ outline: '2px solid var(--accent, #f26a1b)', outlineOffset: '-2px', borderRadius: 6, padding: '6px 8px' }}>
+              <strong style={{ fontSize: 12 }}>{pickedIds.length} ticked</strong>
+              <span className={ui.row} style={{ gap: 4 }} role="group" aria-label="Move the ticked tools">
+                {([['←', -1, 0], ['↑', 0, -1], ['↓', 0, 1], ['→', 1, 0]] as [string, number, number][]).map(([icon, dx, dy]) => (
+                  <button key={icon} type="button" className={`${ui.btn} ${ui.btnSm}`} aria-label={`Move the ticked tools ${icon}`}
+                    title="Move every ticked tool 1 mm (Shift = 5 mm) — the arrow keys do the same"
+                    onClick={(e) => nudgeIds(pickedIds, dx * (e.shiftKey ? 5 : 1), dy * (e.shiftKey ? 5 : 1))}>{icon}</button>
+                ))}
+              </span>
+              <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => setPickedIds([])}>Clear ticks</button>
+              <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} title="Delete / Backspace does the same" onClick={() => removeTools(pickedIds)}>✕ Remove {pickedIds.length}</button>
+              <span className={ui.hint} style={{ flexBasis: '100%' }}>Arrow keys move them together (Shift = 5 mm) · R rotates · Delete removes · Escape clears the ticks.</span>
+            </div>
+          )}
           <div className={ui.list}>
             {tools.filter((t) => t.polygon_mm.length >= 3).map((t) => (
-              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`} onClick={() => setSelectedId(t.id)} style={{ gridTemplateColumns: '12px 1fr auto auto', opacity: t.include ? 1 : 0.5 }}>
+              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
+                onClick={(e) => (pickMod(e) ? togglePick(t.id) : setSelectedId(t.id))}
+                style={{ gridTemplateColumns: '12px auto 1fr auto auto', opacity: t.include ? 1 : 0.5, ...(isPicked(t.id) ? { outline: '2px solid var(--accent, #f26a1b)', outlineOffset: '-2px' } : null) }}>
                 <span className={ui.swatch} style={{ background: t.color }} />
-                <input aria-label={`Rename ${t.name}`} className={ui.toolName} value={t.name} onClick={(e) => e.stopPropagation()} onChange={(e) => updateTool(t.id, (x) => ({ ...x, name: e.target.value }))} />
+                <button type="button" aria-pressed={isPicked(t.id)} aria-label={isPicked(t.id) ? `Untick ${t.name}` : `Tick ${t.name}`}
+                  title="Ctrl/Cmd-click to tick several tools and move or remove them together"
+                  style={{ background: 'none', border: 0, padding: 0, cursor: 'pointer', font: 'inherit' }}
+                  onClick={(e) => { e.stopPropagation();          // the row handles it too; a TOGGLE must not fire twice
+                                    togglePick(t.id); }}>{isPicked(t.id) ? '☑ ' : '☐ '}</button>
+                <input aria-label={`Rename ${t.name}`} className={ui.toolName} value={t.name}
+                  onClick={(e) => { e.stopPropagation(); if (pickMod(e)) { e.preventDefault(); togglePick(t.id); } }}
+                  onChange={(e) => updateTool(t.id, (x) => ({ ...x, name: e.target.value }))} />
                 <span className={ui.toolMeta}>{t.source === 'object' ? '3D · ' : t.source === 'shape' ? '▭ · ' : ''}{t.include ? fmtMm(resolveDepth(t, settings)) : 'skipped'}{resolveDepth(t, settings) === null && t.include ? 'through' : ''}</span>
                 <input type="checkbox" checked={t.include} aria-label={`Include ${t.name} in export`} title="Include in export" onClick={(e) => e.stopPropagation()} onChange={(e) => updateTool(t.id, (x) => ({ ...x, include: e.target.checked }))} />
               </div>
             ))}
+            {tools.filter((t) => t.polygon_mm.length >= 3).length > 1 && !pickedIds.length &&
+              <p className={ui.hint}>Ctrl/Cmd-click tools (in the list or on the sheet) to tick several, then move or remove them together.</p>}
           </div>
         </div>
 

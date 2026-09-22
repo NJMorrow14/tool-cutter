@@ -222,6 +222,13 @@ export function splitTool(sessionId: string, toolId: string, line: [number[], nu
   return postJson<{ tools: ToolResult[]; removed: string }>(`/api/sessions/${sessionId}/split`, { tool_id: toolId, line, edge_source: edgeSource }, 'Split failed');
 }
 
+/** Combine several tools of ONE scan into a single outline. The originals are gone server-side.
+ *  `bridged_mm` > 0 means the parts were not touching and a bridge of that width was drawn to join them. */
+export function mergeTools(sessionId: string, toolIds: string[], bridgeMm?: number) {
+  return postJson<{ tools: ToolResult[]; removed: string[]; bridged_mm: number }>(
+    `/api/sessions/${sessionId}/merge`, { tool_ids: toolIds, ...(bridgeMm === undefined ? {} : { bridge_mm: bridgeMm }) }, 'Combine failed');
+}
+
 export interface Placement { id: string; rotation_deg: number; offset_mm: { x: number; y: number } }
 
 /** Pack the included tools onto the mat (biggest first, long side horizontal or vertical, `gap` mm between pockets). */

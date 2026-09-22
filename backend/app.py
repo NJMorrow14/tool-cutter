@@ -2406,6 +2406,74 @@ def split_tool(sid: str):
     return jsonify({"tools": out, "removed": tid})
 
 
+@app.post("/api/sessions/<sid>/merge")
+def merge_tools(sid: str):
+    """Combine several tools into one — the inverse of /split.
+
+    body: {tool_ids: [...], bridge_mm?}. The tools' stored masks are unioned and the seam between them is
+    healed by a closing of `bridge_mm` (default 2.0, capped at 6.0 — a wide closing fills T/L inner corners,
+    which is why the reconnection elsewhere in this file is held to 2 mm). Parts that are still apart after
+    that are joined by a straight bridge of the same width between their nearest points, so the call always
+    yields ONE outline; `bridged_mm` reports the widest gap that had to be crossed, and the UI says so.
+
+    The parts' own edges are kept as they were derived — the union is NOT re-thresholded. Each part was already
+    traced against its own local topography, and re-deriving the whole would judge a small part against the
+    tall one's top and eat it. Returns {tools: [one], removed: [ids]}.
+    """
+    s = _require_rectified(_session(sid))
+    body = request.get_json(force=True, silent=True) or {}
+    ids = [str(t) for t in (body.get("tool_ids") or []) if str(t)]
+    if len(ids) < 2:
+        raise ApiError("Select at least two tools to combine.")
+    missing = [t for t in ids if s.masks.get(t) is None]
+    if missing:
+        raise ApiError(f"Unknown tool(s) in this scan: {', '.join(missing)}. "
+                       "Hand-drawn shapes and tools from another capture cannot be combined here.", 404)
+    masks = [s.masks[t] for t in ids]
+    union = np.zeros_like(masks[0], dtype=bool)
+    for m in masks:
+        union |= m.astype(bool)
+    bridge_mm = min(6.0, max(0.0, _f(body, "bridge_mm", 2.0) or 0.0))
+    if bridge_mm > 0:
+        k = max(3, int(round(bridge_mm / s.mm_per_px)) | 1)
+        union = cv2.morphologyEx(union.astype(np.uint8), cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(bool)
+    # Anything still separate is joined explicitly: the user asked for one tool, so produce one rather than
+    # returning a polygon with holes in the middle of it.
+    bridged_mm = 0.0
+    comps = geometry.split_components(union, 1.0)
+    while len(comps) > 1:
+        a = comps[0]
+        ya, xa = np.nonzero(a)
+        best = None
+        for other in comps[1:]:
+            yb, xb = np.nonzero(other)
+            step = max(1, len(xa) // 2000), max(1, len(xb) // 2000)
+            pa = np.stack([xa[::step[0]], ya[::step[0]]], 1).astype(np.float32)
+            pb = np.stack([xb[::step[1]], yb[::step[1]]], 1).astype(np.float32)
+            d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
+            i, j = np.unravel_index(int(np.argmin(d)), d.shape)
+            if best is None or d[i, j] < best[0]:
+                best = (float(d[i, j]), tuple(pa[i].astype(int)), tuple(pb[j].astype(int)), other)
+        gap, p1, p2, other = best
+        bridged_mm = max(bridged_mm, gap * s.mm_per_px)
+        link = np.zeros(union.shape, np.uint8)
+        cv2.line(link, p1, p2, 1, max(1, int(round(max(1.0, bridge_mm) / s.mm_per_px))))
+        union |= link.astype(bool)
+        comps = geometry.split_components(union, 1.0)
+    if not union.any():
+        raise ApiError("Those tools have no scanned area to combine.")
+    nid = str(body.get("id") or f"m{int(time.time()) % 100000}_1")
+    dt = cv2.distanceTransform(union.astype(np.uint8), cv2.DIST_L2, 3)
+    py, px = np.unravel_index(int(np.argmax(dt)), dt.shape)
+    ys, xs = np.nonzero(union)
+    box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+    tool = _topo_tool_result(s, nid, union, [{"x": float(px), "y": float(py), "label": 1}], box)
+    for t in ids:
+        s.masks.pop(t, None)
+    return jsonify({"tools": [tool], "removed": ids, "bridged_mm": round(bridged_mm, 1)})
+
+
 @app.post("/api/autolayout")
 def autolayout():
     """Pack the tools onto the mat: {mat: {width_mm, height_mm}, tools: [{id, polygon_mm, include?}], gap_mm?,

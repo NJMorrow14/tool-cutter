@@ -6,7 +6,7 @@ import st from './stage.module.css';
 import ed from './editor.module.css';
 import ScanViewer from './ScanViewer';
 import AddShape from './AddShape';
-import { API_BASE_URL, autoDetect, imageUrl, segment, snapToBase, splitTool } from '../lib/api';
+import { API_BASE_URL, autoDetect, imageUrl, mergeTools, segment, snapToBase, splitTool } from '../lib/api';
 import { arcLengths, bestShape, shapeFromDrag, shapeTool, fitShapes, softDragRing, type ShapeFit, fmtMm, pointSegment, polyToPath, polygonArea, resampleRing, ringBounds, simplifyRing, smoothRing, toolColor, toolFromResult, uid } from '../lib/geom';
 import { PAGES, PRINT_DEFAULTS, printOutlines, type PageSize } from '../lib/print';
 import type { PromptPoint, SessionInfo, ShapeKind, Tool, ToolResult } from '../lib/types';
@@ -66,6 +66,9 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   // here (this is where you add them) but are moved and sized in Layout
   const shapes = useMemo(() => tools.filter((t) => t.source === 'shape'), [tools]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Tools ticked for combining. Kept apart from selectedId: one tool is being EDITED, several are being GATHERED.
+  const [combineIds, setCombineIds] = useState<string[]>([]);
+  const [combining, setCombining] = useState(false);
   const selected = mine.find((t) => t.id === selectedId) ?? null;
   const editable = selected && selected.polygon_px.length >= 3 ? selected : null;
 
@@ -81,7 +84,8 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const [recovery, setRecovery] = useState<Tool[] | null>(null);
   useEffect(() => { if (selectedId) setInspector('edit'); }, [selectedId]);
   const [error, setError] = useState<string | null>(null);
-  const [autoOpts, setAutoOpts] = useState({ mode: 'auto' as 'auto' | 'color' | 'height', min_area_mm2: 200, height_threshold_mm: 2, refine_with_sam: session.source_kind === 'capture' || !rect.has_height });
+  // refine_with_sam is only ever the no-height fallback now; it is never offered as a choice.
+  const [autoOpts, setAutoOpts] = useState({ mode: 'auto' as 'auto' | 'color' | 'height', min_area_mm2: 200, height_threshold_mm: 2, refine_with_sam: !rect.has_height });
   const [shapeMode, setShapeMode] = useState(false);     // outline everything as a simple primitive
   const [shapeMinIou, setShapeMinIou] = useState(0.82);  // how close a primitive must be before it is accepted
   const [pageSize, setPageSize] = useState<PageSize>(PRINT_DEFAULTS.page);
@@ -99,7 +103,11 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const lastDelta = useRef<number[]>([0, 0]);
   useEffect(() => { dragRef.current = drag; }, [drag]);
 
-  const edgeSource: 'topo' | 'photo' = autoOpts.refine_with_sam && modelAvailable ? 'photo' : rect.has_height ? 'topo' : 'photo';
+  // Borders always come from the scan topography. Nolan, 2026-09-22: "I dont want to ever follow visible tool
+  // edges" — photo edges chase printed labels, shadows and specular highlights, and every measurement of that
+  // path in this repo lost to the topographic one. "photo" survives ONLY as the fallback for a capture with no
+  // height at all (a plain photo upload), where there is no topography to trace; it is never a user choice.
+  const edgeSource: 'topo' | 'photo' = rect.has_height ? 'topo' : 'photo';
   const canClick = rect.has_height || modelAvailable;
 
   // ------------------------------------------------------------------ view maths
@@ -147,6 +155,44 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     if (w / h > aspect) h = w / aspect; else w = h * aspect;
     setView(clampView({ x: (x0 + x1) / 2 - w / 2, y: (y0 + y1) / 2 - h / 2, w, h }));
   }, [W, H]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Ctrl/Cmd- or Shift-click gathers tools instead of selecting one, the same modifier pair the canvas uses. */
+  const toggleCombine = useCallback((id: string) => {
+    setCombineIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  }, []);
+
+  /** Combine the gathered tools into one outline (server-side: their masks are unioned and the seam healed). */
+  const combineSelected = useCallback(async () => {
+    if (combineIds.length < 2 || combining) return;
+    setCombining(true);
+    const previous = mine;
+    const first = mine.find((t) => t.id === combineIds[0]);
+    setError(null);
+    try {
+      const res = await mergeTools(session.id, combineIds);
+      const idx = Math.max(0, tools.findIndex((t) => t.id === combineIds[0]));
+      const merged = res.tools.filter((r) => r.polygon_px.length >= 3)
+        .map((r, i) => {
+          const nt = toolFromResult(r, tools.length + i, session.source_kind, first?.name);
+          if (first) nt.color = first.color;        // the combined tool keeps the first one's identity
+          return nt;
+        });
+      if (!merged.length) { setError('Combine produced no outline; the tools were left alone.'); return; }
+      setRecovery(previous);                        // same undo affordance as "Clear list"
+      setTools((prev) => {
+        const rest = prev.filter((t) => !res.removed.includes(t.id));
+        const at = Math.max(0, Math.min(idx, rest.length));
+        return [...rest.slice(0, at), ...merged, ...rest.slice(at)];
+      });
+      setCombineIds([]);
+      setSelectedId(merged[0].id);
+      if (res.bridged_mm > 0) setError(`Combined ${res.removed.length} tools — they were ${res.bridged_mm} mm apart, so a bridge was drawn to join them.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Combine failed');
+    } finally {
+      setCombining(false);
+    }
+  }, [combineIds, combining, mine, tools, session.id, session.source_kind]);
 
   /** Selecting from the list zooms to the tool; clicking it on the canvas does not — you are already looking at it. */
   const selectTool = useCallback((id: string | null, fit = false) => {
@@ -424,12 +470,14 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     const down = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
-      if (!selected) return;
+      // Escape must still clear combine ticks when no tool is being edited, so the guard allows that case
+      // through; every branch below that needs a tool checks for one.
+      if (!selected && !combineIds.length) return;
       const stepMm = e.shiftKey ? 2 : 0.5;
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (sel.size) deleteSel(); else removeTool(selected.id);
+        if (sel.size) deleteSel(); else if (selected) removeTool(selected.id);
         e.preventDefault();
-      } else if (e.key === 'Escape') { if (sel.size) setSel(new Set()); else setSelectedId(null); }
+      } else if (e.key === 'Escape') { if (combineIds.length) setCombineIds([]); else if (sel.size) setSel(new Set()); else setSelectedId(null); }
       else if (!editable) return;
       else if (e.key === 'ArrowLeft') { nudgeSel(-stepMm, 0); e.preventDefault(); }
       else if (e.key === 'ArrowRight') { nudgeSel(stepMm, 0); e.preventDefault(); }
@@ -483,6 +531,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
         </details>}
         {recovery && <div className={ed.notice} role="status"><span>Previous tool list available.</span><button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => { setTools(prev => [...prev.filter(t => t.session_id !== session.id), ...recovery]); setRecovery(null); setSelectedId(null); }}>Undo list change</button><button className={ui.iconBtn} aria-label="Dismiss undo message" onClick={() => setRecovery(null)}>×</button></div>}
         <ScanViewer session={session} tools={[...mine, ...shapes]} selectedId={selectedId} onSelect={(id) => selectTool(id)} softMm={softMm}
+          tickedIds={combineIds} onToggleSelect={toggleCombine}
           edit={{
             onEditStart: (id) => { const t = tools.find((x) => x.id === id); if (t) record(t); },
             onEdit: (id, poly) => commit(id, poly, false),
@@ -537,10 +586,6 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
                   <input className={ui.input} type="number" min={0.5} step={0.5} value={autoOpts.height_threshold_mm} onChange={(e) => setAutoOpts({ ...autoOpts, height_threshold_mm: Number(e.target.value) })} />
                 </label>
               )}
-              <label className={ui.checkbox} title="Find complete tools in the displayed photo. Recommended when phone depth and photos do not line up. Turn off for depth-only detection.">
-                <input type="checkbox" checked={autoOpts.refine_with_sam} disabled={!modelAvailable} onChange={(e) => setAutoOpts({ ...autoOpts, refine_with_sam: e.target.checked })} />
-                Follow visible tool edges (recommended)
-              </label>
               <label className={ui.checkbox} title="Replace each traced outline with the rectangle, capsule, circle or hexagon that covers it best, turned to the tool's own angle. Anything too irregular keeps its traced line.">
                 <input type="checkbox" checked={shapeMode} onChange={(e) => setShapeMode(e.target.checked)} />
                 Outline as simple shapes
@@ -569,7 +614,17 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
               {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Replace every traced outline with the simple shape that fits it best" onClick={simplifyAll}>◻ Shapes</button>}
               {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Print every outline at 1:1, one tool after another" onClick={() => doPrint(drawn)}>🖨 All</button>}
               <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Add a plain rectangle, slot, circle or hexagon — for something the scan cannot see" onClick={() => setAddingShape(!addingShape)}>+ Shape</button>
-              {mine.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} onClick={() => { setRecovery(mine); setTools((prev) => prev.filter((t) => t.session_id !== session.id)); setSelectedId(null); }}>Clear list</button>}
+              {mine.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} onClick={() => { setRecovery(mine); setTools((prev) => prev.filter((t) => t.session_id !== session.id)); setSelectedId(null); setCombineIds([]); }}>Clear list</button>}
+              {combineIds.length > 0 && (
+                <>
+                  <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={combineIds.length < 2 || combining}
+                          title={combineIds.length < 2 ? 'Ctrl/Cmd-click another tool to combine it with this one' : 'Combine the ticked tools into one outline'}
+                          onClick={combineSelected}>
+                    {combining ? 'Combining…' : `⊕ Combine ${combineIds.length}`}
+                  </button>
+                  <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => setCombineIds([])}>Clear ticks</button>
+                </>
+              )}
             </span>
           </div>
           {addingShape && (
@@ -583,9 +638,15 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           <input className={ui.input} type="search" placeholder="Search tools…" aria-label="Search tools" value={query} onChange={e => setQuery(e.target.value)} />
           <div className={ui.list}>
             {mine.filter(t => t.name.toLowerCase().includes(query.toLowerCase())).map((t) => (
-              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`} onClick={() => selectTool(t.id, true)}>
+              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
+                   style={combineIds.includes(t.id) ? { outline: '2px solid var(--accent, #f26a1b)', outlineOffset: '-2px' } : undefined}
+                   onClick={(e) => (e.metaKey || e.ctrlKey || e.shiftKey) ? toggleCombine(t.id) : selectTool(t.id, true)}>
                 <span className={ui.swatch} style={{ background: t.color }} />
-                <button type="button" aria-label={`Edit ${t.name}`} className={ui.toolName} onClick={() => selectTool(t.id, true)}>{t.name}</button>
+                <button type="button" aria-label={combineIds.includes(t.id) ? `Remove ${t.name} from the combine selection` : `Edit ${t.name}`}
+                        aria-pressed={combineIds.includes(t.id)} className={ui.toolName}
+                        onClick={(e) => { e.stopPropagation();          // the row handles it too; a TOGGLE must not fire twice
+                                          if (e.metaKey || e.ctrlKey || e.shiftKey) toggleCombine(t.id); else selectTool(t.id, true); }}>
+                  {combineIds.includes(t.id) ? '☑ ' : ''}{t.name}</button>
                 <span className={ui.toolMeta}>
                   {t.pending ? <span className={ui.spinner} /> : t.error ? '⚠' : `${(t.area_mm2 / 100).toFixed(1)} cm²`}
                   {t.measured_thickness_mm !== null && !t.pending ? ` · ${fmtMm(t.measured_thickness_mm)}` : ''}
@@ -596,6 +657,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
             ))}
             {!mine.length && <div className={ui.emptyState}><strong>Start with an outline</strong>Detect all tools at once, or click a tool on the canvas to add it individually.</div>}
             {!!mine.length && !mine.some(t => t.name.toLowerCase().includes(query.toLowerCase())) && <p className={ui.hint}>No tools match “{query}”.</p>}
+            {mine.length > 1 && !combineIds.length && <p className={ui.hint}>Cmd/Ctrl-click tools — here or on the scan — to tick several, then Combine them into one outline.</p>}
             {imported > 0 && <p className={ui.hint}>{imported} imported tool model{imported > 1 ? 's' : ''} will join these in the layout.</p>}
           </div>
           {shapes.length > 0 && (

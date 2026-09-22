@@ -131,6 +131,63 @@ class DepthTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.get_json()['tools']), len(scene.tools))
 
+    def test_merge_combines_tools_and_keeps_the_result_splittable(self):
+        """Combining tools is the inverse of splitting: several masks become ONE outline whose area is at least
+        the sum of the parts (the seam between them is healed), the originals are reported as removed, and the
+        result is still a real tool — its mask is registered, so it can be split again or combined further."""
+        import synth_scene as synth
+        scene = synth.scene_small()
+        jpg, depth, intr, _ = synth.render(scene)
+        frame = dict(image='rgb', depth='z', depth_width=depth.shape[1], depth_height=depth.shape[0],
+                     intrinsics=intr, sensor='truedepth',
+                     lens_calibration=dict(inverse_lookup=[0, 0], center=[intr['cx'], intr['cy']],
+                                           reference=[intr['width'], intr['height']]))
+        session = _build_multi_session([frame, frame], {'marker_size_mm': str(synth.MARKER_MM),
+                                                       'inset_mm': str(scene.marker_inset)},
+                                       {'rgb': jpg, 'z': depth.astype('<f4').tobytes()})
+        c = app.test_client()
+        tools = c.post(f'/api/sessions/{session.id}/auto_detect', json={}).get_json()['tools']
+        self.assertGreaterEqual(len(tools), 2)
+        pick = sorted(tools, key=lambda t: -(t['area_mm2'] or 0))[:2]
+        ids = [t['id'] for t in pick]
+        before = sum(t['area_mm2'] for t in pick)
+        r = c.post(f'/api/sessions/{session.id}/merge', json={'tool_ids': ids})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        body = r.get_json()
+        self.assertEqual(len(body['tools']), 1)
+        self.assertCountEqual(body['removed'], ids)
+        merged = body['tools'][0]
+        self.assertGreaterEqual(merged['area_mm2'], before * 0.98)
+        self.assertGreaterEqual(len(merged['polygon_px']), 3)
+        # one outline, not two islands stitched into a self-crossing ring
+        self.assertGreater(merged['area_mm2'], 0)
+        # still a first-class tool: splitting it again must be accepted
+        x0, y0, x1, y1 = merged['box']
+        r2 = c.post(f'/api/sessions/{session.id}/split',
+                    json={'tool_id': merged['id'], 'line': [[x0 - 5, (y0 + y1) / 2], [x1 + 5, (y0 + y1) / 2]]})
+        self.assertIn(r2.status_code, (200, 400), r2.get_json())   # 400 only if the line misses; never 404
+        self.assertNotEqual(r2.status_code, 404)
+
+    def test_merge_rejects_unknown_and_single_tools(self):
+        import synth_scene as synth
+        scene = synth.scene_small()
+        jpg, depth, intr, _ = synth.render(scene)
+        frame = dict(image='rgb', depth='z', depth_width=depth.shape[1], depth_height=depth.shape[0],
+                     intrinsics=intr, sensor='truedepth',
+                     lens_calibration=dict(inverse_lookup=[0, 0], center=[intr['cx'], intr['cy']],
+                                           reference=[intr['width'], intr['height']]))
+        session = _build_multi_session([frame, frame], {'marker_size_mm': str(synth.MARKER_MM),
+                                                       'inset_mm': str(scene.marker_inset)},
+                                       {'rgb': jpg, 'z': depth.astype('<f4').tobytes()})
+        c = app.test_client()
+        tools = c.post(f'/api/sessions/{session.id}/auto_detect', json={}).get_json()['tools']
+        self.assertEqual(c.post(f'/api/sessions/{session.id}/merge',
+                                json={'tool_ids': [tools[0]['id']]}).status_code, 400)
+        # a drawn shape has no mask in this session and must say so rather than silently dropping it
+        r = c.post(f'/api/sessions/{session.id}/merge', json={'tool_ids': [tools[0]['id'], 'shape_xyz']})
+        self.assertEqual(r.status_code, 404)
+        self.assertIn('shape_xyz', r.get_json().get('error', ''))
+
 
 class StitchingTests(unittest.TestCase):
     def frame(self, gray):

@@ -15,6 +15,11 @@ interface Props {
   tools: Tool[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  /** Tools ticked for a bulk action. Drawn in the accent colour so a gathered set reads at a glance. */
+  tickedIds?: string[];
+  /** Cmd/Ctrl+CLICK on a tool toggles it here. Shift and Alt are taken (hint points) and Cmd+DRAG is split,
+   *  so a modifier CLICK is the one gesture still free — the same click-vs-drag split the rest of the canvas uses. */
+  onToggleSelect?: (id: string) => void;
   /** Outline editing, straight on the scan. Pixel coordinates throughout, as in the rectified image. */
   edit?: EditHooks;
   softMm?: number;
@@ -46,7 +51,7 @@ function placed(t: Tool): number[][] {
 
 /** The fused LiDAR scan of the drawer as an orbitable 3D surface with the photo draped on it and the tool
  *  outlines drawn on the surface. Click a tool to select it. */
-export default function ScanViewer({ session, tools, selectedId, onSelect, edit, softMm = 0, drawArmed = false, splitArmed = false }: Props) {
+export default function ScanViewer({ session, tools, selectedId, onSelect, tickedIds, onToggleSelect, edit, softMm = 0, drawArmed = false, splitArmed = false }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [status, setStatus] = useState<string | null>('Loading scan…');
   const [zScale, setZScale] = useState(1);
@@ -107,7 +112,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
 
     // ---------------------------------------------------------------- pointer: select, create, reshape, split
     const ray = new THREE.Raycaster();
-    let down: { x: number; y: number; shift: boolean; alt: boolean } | null = null;
+    let down: { x: number; y: number; shift: boolean; alt: boolean; meta: boolean; ctrl: boolean } | null = null;
     let hdrag: { id: string; anchor: number; poly0: number[][]; arc: number[]; per: number; from: THREE.Vector3; z0: number } | null = null;
     let cut: { id: string; from: THREE.Vector3; line: THREE.Line } | null = null;
     let draw: { from: THREE.Vector3; box: THREE.Line } | null = null;
@@ -133,7 +138,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
     const tolAt = (p: THREE.Vector3) => Math.max(3, camera.position.distanceTo(root.localToWorld(p.clone())) * 0.02);
 
     const onDown = (e: PointerEvent) => {
-      down = { x: e.clientX, y: e.clientY, shift: e.shiftKey, alt: e.altKey };
+      down = { x: e.clientX, y: e.clientY, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey, ctrl: e.ctrlKey };
       hdrag = null;
       const hooks = editRef.current;
       const t = editableRef.current;
@@ -233,6 +238,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
       const t = editableRef.current;
       if (hooks && t && (mods.shift || mods.alt)) { hooks.onHint(t.id, p.x / mpp, p.y / mpp, mods.alt ? 'neg' : 'pos'); return; }
       const found = toolsRef.current.find((x) => x.polygon_mm.length >= 3 && pointInPolygon(p.x, p.y, placed(x)));
+      if (found && (mods.meta || mods.ctrl) && onToggleRef.current) { onToggleRef.current(found.id); return; }
       if (found) { onSelectRef.current(found.id); return; }
       if (selectedRef.current) { onSelectRef.current(null); return; }   // first click on the mat lets go
       hooks?.onCreate(p.x / mpp, p.y / mpp);                            // then a click outlines something new
@@ -260,6 +266,9 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
   const toolsRef = useRef(tools);
   toolsRef.current = tools;
   const onSelectRef = useRef(onSelect);
+  const onToggleRef = useRef(onToggleSelect);
+  onToggleRef.current = onToggleSelect;
+  const tickedRef = useRef<string[]>(tickedIds ?? []);
   onSelectRef.current = onSelect;
   const zRef = useRef(zScale);
   zRef.current = zScale;
@@ -301,6 +310,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
     for (const t of toolsRef.current) {
       if (t.polygon_mm.length < 3) continue;
       const sel = t.id === selectedRef.current;
+      const ticked = tickedRef.current.includes(t.id);
       const pts: THREE.Vector3[] = [];
       const poly = placed(t);
       for (let i = 0; i < poly.length; i++) {
@@ -312,8 +322,13 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
         }
       }
       const geom = new THREE.BufferGeometry().setFromPoints(pts);
-      const line = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color(sel ? '#ffffff' : t.color), linewidth: 1 }));
+      const line = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color(sel ? '#ffffff' : ticked ? '#f26a1b' : t.color), linewidth: 1 }));
       s.outlines.add(line);
+      if (ticked && !sel) {          // a gathered tool gets the same double-line emphasis as the selected one
+        const mark = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color('#f26a1b'), transparent: true, opacity: 0.9 }));
+        mark.position.z = 1.6;
+        s.outlines.add(mark);
+      }
       if (sel) {
         const glow = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color(t.color), transparent: true, opacity: 0.9 }));
         glow.position.z = 1.6;
@@ -332,6 +347,29 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, edit,
   };
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
+  tickedRef.current = tickedIds ?? [];
+
+  // Test hook, same idea as Layout3D's __layout3d: headless tests need a tool's SCREEN position to click it,
+  // and clicking the middle of the canvas hides exactly the bugs worth catching.
+  useEffect(() => {
+    (window as unknown as { __scan3d?: unknown }).__scan3d = {
+      ids: () => toolsRef.current.filter((t) => t.polygon_mm.length >= 3).map((t) => t.id),
+      screenPos: (id: string) => {
+        const s = sceneRef.current, el = hostRef.current;
+        const t = toolsRef.current.find((x) => x.id === id);
+        if (!s || !el || !t || t.polygon_mm.length < 3) return null;
+        const poly = placed(t);
+        let cx = 0, cy = 0;
+        for (const q of poly) { cx += q[0]; cy += q[1]; }
+        cx /= poly.length; cy /= poly.length;
+        const v = new THREE.Vector3(cx, cy, (s.hf ? sampleHeight(s.hf, cx, cy) : 0) * zRef.current + 1);
+        s.root.localToWorld(v);
+        v.project(s.camera);
+        const r = el.getBoundingClientRect();
+        return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
+      },
+    };
+  });
   useEffect(() => { rebuildOutlines(); }, [tools, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ------------------------------------------------------------------ height exaggeration / photo toggle
