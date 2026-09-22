@@ -52,3 +52,29 @@ Thumbs.db
 # Miscellaneous
 *.tmp
 *.temp
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Smoke-test outputs
+backend/tests/out/
+
+# Xcode
+ios/**/xcuserdata/
+ios/**/DerivedData/
+ios/**/*.xcworkspace/xcshareddata/swiftpm/
+
+# runtime secrets
+env/*.env
+.env.local
+apps/*/.env.local
+models/
+
+# raw phone captures (large; real customer drawers)
+backend/captures/
+
+# Swift build products (mac/Photogrammetry)
+.build/
+
+# generated analysis output (regenerate with tests/*_eval.py)
+/output/

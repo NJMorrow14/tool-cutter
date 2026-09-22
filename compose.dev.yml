@@ -1,0 +1,22 @@
+# Local dev database only: docker compose -f compose.dev.yml up -d
+# (The Intel Homebrew Postgres under /usr/local stopped running on macOS 27 without Rosetta.)
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: toolfoam
+      POSTGRES_PASSWORD: toolfoam
+      POSTGRES_DB: toolfoam
+    volumes:
+      - tf-dev-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toolfoam"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  tf-dev-pgdata:

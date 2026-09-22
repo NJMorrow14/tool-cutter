@@ -1,0 +1,40 @@
+name: ToolCutter
+options:
+  bundleIdPrefix: com.nolanmorrow
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  ToolCutter:
+    type: application
+    platform: iOS
+    sources:
+      - path: ToolCutter
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nolanmorrow.toolcutter
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        SUPPORTS_MACCATALYST: NO
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: "ToolCutter uses the camera, TrueDepth or LiDAR to measure your tools."
+        INFOPLIST_KEY_NSMotionUsageDescription: "ToolCutter uses motion to avoid blurry scan frames."
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "ToolCutter sends captures to the ToolCutter server on your Mac over the local network."
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Import a drawer photo from your library."
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait"
+        INFOPLIST_KEY_UIRequiredDeviceCapabilities: "arkit"
+    info:
+      path: ToolCutter/Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
+        NSBonjourServices:
+          - _http._tcp

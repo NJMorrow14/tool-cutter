@@ -1,0 +1,63 @@
+# Production stack on prod-apps. Landing site on 8086, admin on 8087, foam API on 8088 (LAN only).
+# Tunnel ingress on prod-data routes <domain> -> 8086 and admin.<domain> -> 8087; admin.<domain> is additionally
+# gated by Cloudflare Access. Postgres is co-located for MVP (volume tf-pgdata); promote to prod-data later.
+services:
+  tf-web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-https://toolfoampro.com}
+    restart: unless-stopped
+    ports:
+      - "8086:3001"
+    env_file:
+      - env/web.env
+    depends_on:
+      tf-db:
+        condition: service_healthy
+
+  tf-admin:
+    build:
+      context: .
+      dockerfile: apps/admin/Dockerfile
+      args:
+        NEXT_PUBLIC_WEB_URL: ${PUBLIC_WEB_URL:-https://toolfoampro.com}
+        NEXT_PUBLIC_API_BASE_URL: ${PUBLIC_API_URL:-https://api.toolfoampro.com}
+    restart: unless-stopped
+    ports:
+      - "8087:3000"
+    env_file:
+      - env/admin.env
+    depends_on:
+      tf-db:
+        condition: service_healthy
+
+  tf-api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    ports:
+      - "8088:8000"
+    environment:
+      HQSAM_CKPT: /models/sam_hq_vit_b.pth
+    volumes:
+      - ./models:/models:ro          # put sam_hq_vit_b.pth here on the server (gitignored, ~380 MB)
+
+  tf-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: toolfoam
+      POSTGRES_PASSWORD: toolfoam
+      POSTGRES_DB: toolfoam
+    volumes:
+      - tf-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toolfoam"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tf-pgdata:
