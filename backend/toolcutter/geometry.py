@@ -173,6 +173,180 @@ def smooth_ring(coords: np.ndarray, sigma: float, tol: float, step: Optional[flo
     return sm
 
 
+def _resample_closed(pts: np.ndarray, step: float) -> np.ndarray:
+    """Closed ring re-sampled at a uniform arc-length step (mm in, mm out)."""
+    pts = np.asarray(pts, dtype=np.float64)
+    seg = np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1)
+    total = float(seg.sum())
+    if total < 3 * step:
+        return pts
+    n = max(12, int(round(total / step)))
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    t = np.linspace(0.0, total, n, endpoint=False)
+    closed = np.vstack([pts, pts[:1]])
+    return np.column_stack([np.interp(t, cum, closed[:, 0]), np.interp(t, cum, closed[:, 1])])
+
+
+def _fit_circle(pts: np.ndarray):
+    """Algebraic (Kasa) circle fit -> (centre, radius, max |radial residual|)."""
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([x, y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy = sol[0] / 2, sol[1] / 2
+    r2 = sol[2] + cx * cx + cy * cy
+    if not np.isfinite(r2) or r2 <= 0:
+        return None
+    r = float(np.sqrt(r2))
+    sres = np.hypot(x - cx, y - cy) - r
+    if len(sres) > 6:
+        from scipy.ndimage import gaussian_filter1d
+        lp = gaussian_filter1d(sres, 3.0, mode="nearest")          # samples are ~0.5 mm apart: a ~1.5 mm low-pass
+        # systematic misfit (not a circle) shows in the low-passed residual; wobble up to 3x tol is fine
+        return np.array([cx, cy]), r, float(max(np.abs(lp).max(), np.percentile(np.abs(sres), 95) / 3.0))
+    return np.array([cx, cy]), r, float(np.abs(sres).max())
+
+
+def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, step: float = 0.5) -> np.ndarray:
+    """Re-express a dense traced outline as the shape a person would draw: sharp corners, straight edges as
+    two points, round parts as arcs, and anything else as a smoothed curve — every piece within `tol` mm of
+    the trace. Nolan (2026-09-23): outlines were "not smooth, too many vertexes, and not understanding the
+    overall shape". The trace itself is fine (0.1-0.3 mm rms wobble); it was being kept at a 0.15 mm tolerance,
+    finer than the sensor's own ~2 mm edge response, so every pixel-scale wiggle survived as a vertex.
+
+    Corners first: the turning angle summed over a +-2 mm window, peaks >= corner_deg, at least 3 mm apart. Splitting
+    there is what keeps a hammer head square and a ruler's ends crisp while its long sides collapse to 2 points.
+    """
+    pts = np.asarray(pts_mm, dtype=np.float64)
+    if len(pts) < 8:
+        return pts
+    r = _resample_closed(pts, step)
+    n = len(r)
+    if n < 12:
+        return pts
+    # judge corners and fits on a lightly smoothed ring (1 mm, cyclic) so pixel noise cannot fake a corner or
+    # fail a straight edge; the pieces are still checked against the trace within tol
+    from scipy.ndimage import gaussian_filter1d
+    # fitting smoothness scales with the tolerance: a fixed 1 mm ate the tips of 5 mm shafts (hex key -0.06 IoU)
+    fit_sig = max(1.0, 0.75 * tol / step)
+    r = np.column_stack([gaussian_filter1d(r[:, j], fit_sig, mode="wrap") for j in range(2)])
+    # corners are found on a 2 mm-smoothed copy: a real corner still turns ~90 deg over the window, while noise
+    # (random in sign) largely cancels in the signed sum below
+    rc = np.column_stack([gaussian_filter1d(r[:, j], max(1.0, 2.0 / step), mode="wrap") for j in range(2)])
+    d1 = rc - np.roll(rc, 1, axis=0)
+    d2 = np.roll(rc, -1, axis=0) - rc
+    ang = np.arctan2(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0], (d1 * d2).sum(axis=1))   # signed turn per vertex
+    w = max(1, int(round(2.0 / step)))
+    kernel = np.ones(2 * w + 1)
+    turn = np.abs(np.convolve(np.concatenate([ang[-w:], ang, ang[:w]]), kernel, mode="valid"))   # cyclic window sum
+    thresh = np.deg2rad(corner_deg)
+    gap = max(1, int(round(3.0 / step)))
+    corners = []
+    order = np.argsort(-turn)
+    taken = np.zeros(n, bool)
+    for i in order:
+        if turn[i] < thresh:
+            break
+        if taken[i]:
+            continue
+        corners.append(int(i))
+        lo = np.arange(i - gap, i + gap + 1) % n
+        taken[lo] = True
+    corners = sorted(corners)
+    if len(corners) < 2:
+        # no corners: treat the whole ring as one cyclic free curve
+        segs = [np.arange(n)]
+        cyclic = True
+    else:
+        segs = [np.arange(a, b + 1) % n for a, b in zip(corners, corners[1:] + [corners[0] + n])]
+        cyclic = False
+    out: List[np.ndarray] = []
+    kinds: List[str] = []
+    lines: List[Optional[tuple]] = []          # (centre, direction) of the least-squares line for line pieces
+    for idx in segs:
+        seg = r[idx]
+        kinds.append("other"); lines.append(None)
+        if len(seg) < 3:
+            out.append(seg[:-1] if not cyclic else seg)
+            continue
+        a, b = seg[0], seg[-1]
+        chord = b - a
+        L = float(np.linalg.norm(chord))
+        # straight?
+        if not cyclic and L > 1e-6:
+            nrm = np.array([-chord[1], chord[0]]) / L
+            sdev = (seg - a) @ nrm
+            dev = np.abs(sdev)
+            # A wall that wobbles is still a wall: its deviation from the chord is zero-mean noise, while an arc's is
+            # a systematic bow (its sagitta). Low-pass the signed deviation over ~3 mm — noise cancels, a bow does not —
+            # and accept a straight run when the bow is within tol even if the raw wobble is up to 3x that. This is
+            # what lets a 330 mm steel rule whose edge wanders 1 mm read as two straight lines instead of 100 points.
+            lp = gaussian_filter1d(sdev, max(1.0, 3.0 / step), mode="nearest") if len(sdev) > 6 else sdev
+            if np.abs(lp).max() <= tol and np.percentile(dev, 95) <= 3 * tol:
+                trim = max(1, len(seg) // 6)                 # ends carry the rounded corner; fit the wall itself
+                core = seg[trim:-trim] if len(seg) > 3 * trim else seg
+                c0 = core.mean(axis=0)
+                _, _, vt = np.linalg.svd(core - c0, full_matrices=False)
+                kinds[-1] = "line"; lines[-1] = (c0, vt[0])
+                out.append(seg[:1])
+                continue
+        # one circular arc?
+        fit = _fit_circle(seg) if len(seg) >= 6 else None
+        if fit is not None and 1.5 <= fit[1] <= 400.0 and fit[2] <= tol:
+            c, rad, _ = fit
+            t0 = np.arctan2(*(seg[0] - c)[::-1]); t1 = np.arctan2(*(seg[-1] - c)[::-1])
+            tm = np.arctan2(*(seg[len(seg) // 2] - c)[::-1])
+            sweep = (t1 - t0 + np.pi) % (2 * np.pi) - np.pi
+            # take the direction that passes through the middle sample
+            if ((tm - t0 + np.pi) % (2 * np.pi) - np.pi) * sweep < 0 or cyclic:
+                sweep = sweep - np.sign(sweep) * 2 * np.pi if not cyclic else 2 * np.pi
+            e = max(0.05, 0.5 * tol)
+            dth = 2 * np.arccos(max(-1.0, min(1.0, 1 - e / rad)))
+            k = max(2, int(np.ceil(abs(sweep) / dth)))
+            th = t0 + sweep * np.arange(0, k, 1) / k if cyclic else t0 + sweep * np.arange(0, k) / k
+            arc = np.column_stack([c[0] + rad * np.cos(th), c[1] + rad * np.sin(th)])
+            out.append(arc)
+            continue
+        # free curve: smooth along the run (ends pinned), then keep only what tol requires
+        sig = fit_sig
+        if len(seg) > 6:
+            from scipy.ndimage import gaussian_filter1d
+            mode = "wrap" if cyclic else "nearest"
+            sm = np.column_stack([gaussian_filter1d(seg[:, j], sig, mode=mode) for j in range(2)])
+            if not cyclic:
+                sm[0], sm[-1] = seg[0], seg[-1]
+        else:
+            sm = seg
+        dp = cv2.approxPolyDP(sm.astype(np.float32).reshape(-1, 1, 2), float(tol), bool(cyclic)).reshape(-1, 2)
+        if not cyclic:
+            dp = np.vstack([seg[:1], dp[1:-1], seg[-1:]]) if len(dp) >= 2 else seg[[0, -1]]
+            out.append(dp[:-1])
+        else:
+            out.append(dp.astype(np.float64))
+    # Two straight edges meeting at a corner: the true corner is where the fitted walls CROSS. The smoothed apex
+    # sits ~0.3 mm inside it, and on a rectangle that is a 0.3 mm inset of every side (IoU 0.984 -> 0.998).
+    if not cyclic:
+        m = len(out)
+        for k in range(m):
+            j = (k - 1) % m
+            if kinds[k] == "line" and kinds[j] == "line" and lines[k] and lines[j] and len(out[k]):
+                (c1, d1_), (c2, d2_) = lines[j], lines[k]
+                den = d1_[0] * d2_[1] - d1_[1] * d2_[0]
+                if abs(den) > 1e-6:
+                    t = ((c2[0] - c1[0]) * d2_[1] - (c2[1] - c1[1]) * d2_[0]) / den
+                    x = c1 + t * d1_
+                    if np.linalg.norm(x - out[k][0]) <= 3.0:     # never let a near-parallel pair fly off
+                        out[k] = out[k].copy(); out[k][0] = x
+    res = np.vstack(out) if out else pts
+    # drop duplicate consecutive points
+    keep = np.linalg.norm(res - np.roll(res, 1, axis=0), axis=1) > 1e-6
+    res = res[keep]
+    return res if len(res) >= 3 else pts
+
+
 def straighten_ring(pts: np.ndarray, coarse_tol: float, min_len: float) -> np.ndarray:
     """Replace long nearly-straight stretches of a closed ring by their least-squares line.
 
@@ -234,14 +408,16 @@ def straighten_ring(pts: np.ndarray, coarse_tol: float, min_len: float) -> np.nd
     return out
 
 
-def smooth_polygon(poly: Polygon, sigma_mm: float, tol_mm: float) -> Polygon:
+def smooth_polygon(poly: Polygon, sigma_mm: float, tol_mm: float, clean_tol_mm: Optional[float] = None) -> Polygon:
     """Gaussian smoothing + straightening of long straight runs, on the exterior and every interior."""
     if poly.is_empty or sigma_mm <= 0:
         return poly
     def _one(coords):
         r = smooth_ring(np.asarray(coords), sigma_mm, 0.0)          # keep dense for straightening
         r = straighten_ring(r, coarse_tol=max(1.5, sigma_mm), min_len=20.0)   # arcs of r<~30 mm keep their points
-        if len(r) >= 3 and tol_mm > 0:
+        if len(r) >= 3 and clean_tol_mm and clean_tol_mm > 0:
+            r = clean_ring(r, tol=float(clean_tol_mm))                           # lines / arcs / smooth curves
+        elif len(r) >= 3 and tol_mm > 0:
             r = cv2.approxPolyDP(r.astype(np.float32).reshape(-1, 1, 2), float(tol_mm), True).reshape(-1, 2).astype(np.float64)
         return r
     ext = _one(poly.exterior.coords)
@@ -546,7 +722,8 @@ def topo_polygon(mask: np.ndarray, mm_per_px: float, signed: Optional[np.ndarray
     try:
         poly = Polygon(pts * mm_per_px)
         if poly.is_valid and poly.area > 1.0:
-            out = smooth_polygon(poly.buffer(0), sigma_mm=sigma_mm, tol_mm=0.15)
+            clean = float(os.environ.get("TC_CLEAN_TOL", "0") or 0) or min(0.5, max(0.35, 0.6 * sigma_mm))
+            out = smooth_polygon(poly.buffer(0), sigma_mm=sigma_mm, tol_mm=0.15, clean_tol_mm=clean)
             if out is not None and not out.is_empty:
                 ring = max(out.geoms, key=lambda g: g.area) if out.geom_type == "MultiPolygon" else out
                 arr = np.asarray(ring.exterior.coords[:-1], dtype=np.float64) / mm_per_px
@@ -555,6 +732,12 @@ def topo_polygon(mask: np.ndarray, mm_per_px: float, signed: Optional[np.ndarray
     except Exception:  # noqa: BLE001
         pass
     sm = smooth_ring(pts, sigma=sigma_mm / mm_per_px, tol=0.3 / mm_per_px)
+    if len(sm) >= 8:
+        clean = float(os.environ.get("TC_CLEAN_TOL", "0") or 0) or min(0.5, max(0.35, 0.6 * sigma_mm))
+        if clean > 0:
+            cl = clean_ring(sm * mm_per_px, tol=float(clean)) / mm_per_px
+            if len(cl) >= 3 and cv2.contourArea(cl.astype(np.float32)) > 0:
+                sm = cl
     return sm if len(sm) >= 3 else None
 
 

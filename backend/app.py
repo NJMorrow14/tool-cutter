@@ -1227,6 +1227,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
         # camera, triggered by hand so nothing is taken mid-move. Both passes still register off the markers,
         # so they land on the same grid without needing a pose chain between them.
         res.meta["use"] = str(f.get("use") or "both").lower()
+        res.meta["has_depth"] = depth is not None
         results.append(res)
         poses.append(pose)
         if is_truedepth(f) and depth is not None and res.geometry is not None:
@@ -1234,6 +1235,39 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
             depth_matches.append(depth_features(img, depth, K, res.geometry))
         else:
             depth_matches.append(None)
+    # DEPTH SCALE CALIBRATION AGAINST THE MARKERS (2026-09-23, from Nolan's calipers). A depth frame gets its
+    # metric scale from the depth itself, and the front TrueDepth depth is not quite metric: on capture
+    # b59fc5fdd2d1 the 50 mm markers measured 52.11 mm in the depth-derived rasters (+4.2 %), and the black tape
+    # measure came out 93.3 mm against a caliper 87.5 — 3.7 mm of that 5.8 mm was this. The markers are a known
+    # length in EVERY frame that sees one, so measure them there and rescale every depth frame (mm/px and heights,
+    # which are depth units too) by the one robust factor. Photogrammetry already does the same from marker
+    # spacing (_session_from_mesh_file). TC_DEPTH_CAL=0 disables; the factor is reported as scan_meta.depth_scale.
+    depth_scale = 1.0
+    if os.environ.get("TC_DEPTH_CAL", "0") == "1":   # OFF by default: marker-placed frames are already metric in-plane; see CLAUDE.md
+        meas = []
+        for res in results:
+            if not res.meta.get("has_depth") or not res.markers_px:
+                continue
+            for c in res.markers_px.values():
+                c = np.asarray(c, dtype=np.float64).reshape(-1, 2)
+                if len(c) == 4:
+                    meas.append(float(np.mean([np.linalg.norm(c[j] - c[(j + 1) % 4]) for j in range(4)])) * res.mm_per_px)
+        if len(meas) >= 3:
+            factor = marker_size / float(np.median(meas))
+            if 0.90 <= factor <= 1.10 and abs(factor - 1.0) >= 0.004:
+                depth_scale = factor
+                for res in results:
+                    if res.meta.get("has_depth"):
+                        res.mm_per_px *= factor
+                        if res.height_mm is not None:
+                            res.height_mm = res.height_mm * np.float32(factor)
+                        if res.geometry is not None:
+                            res.geometry.mm_per_px *= factor
+                log.info("multi-still: depth scale calibrated against %d marker sightings: %.2f mm read for a %.1f mm "
+                         "marker -> x%.4f", len(meas), float(np.median(meas)), marker_size, factor)
+            elif not (0.90 <= factor <= 1.10):
+                log.warning("multi-still: markers read %.1f mm for a declared %.1f mm size — not calibrating (check the print and the marker size setting)",
+                            float(np.median(meas)), marker_size)
     visual_corners = {}
     registration_info = None
     # TrueDepth supplies synchronized metric depth, but no ARKit world pose.
@@ -1661,6 +1695,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
                                 "floor_relevel_mm": round(floor_shift, 1),
                                 "rgbd_registration": registration_info,
                                 "sensors": sorted({str(f.get("sensor", "unknown")) for f in frames_meta}),
+                                "depth_scale": round(depth_scale, 4),
                                 "drawer_from": drawer_from,
                                 # how each frame earned its place, so a new capture path can be diagnosed from the result
                                 "photo_coverage": coverage_report(paint, fused.shape if fused is not None else mosaic.shape[:2]),

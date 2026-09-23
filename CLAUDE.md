@@ -538,6 +538,48 @@ ToolFoam Pro — on-site industrial tool organization (custom-cut foam drawer in
     seeds (seed 5: 0.793 vs 0.854), because rendering the arc first perturbs what the glide scenes come out as.
     Each invocation is internally deterministic (RANSAC is seeded). Only ever compare runs invoked identically —
     several "regressions" chased during this work were that artefact, not the code.
+    **GROUND TRUTH, FINALLY (2026-09-23, Nolan's calipers).** Steel rule **25.0 mm** wide. Black tape measure:
+    **87.5 mm across its base, 89.5 mm at its widest** (a pocket must pass the widest part, so 89.5 is the target).
+    Measured against them, on capture `b59fc5fdd2d1` (78 frames, ALL placed by two markers + the typed 297 x 417
+    drawer — registration exact, so this isolates the sensor + extraction):
+      * tape outline **93.3 mm -> +3.8 mm** over the true widest; **raising height_threshold_mm 2 -> 12 moves it only
+        to 92.5**. The cut level is NOT the lever. The excess is ~1.9 mm per side, which is the sensor's measured
+        20-80 %% edge rise (1.9-2.6 mm on this scan) — IR depth blurs the wall outward, and topo_footprint's "50 %% of
+        the nearest FLAT pixel" lands on the ramp's shoulder. In the height map the tape reads 89.5 mm at 20 mm up,
+        90.4 at 12, 91.5 at 5, 94.5 at 0.5: the sensor SEES the true girth at mid-height; only the low levels are fat.
+      * on the earlier capture `136c77400c3f` the rule read 24.2-24.7 (-0.3 to -0.8 mm) in one build and 27.1 in
+        another of the SAME frames — that build was placing frames a few mm apart (78 one-marker frames), so on
+        one-marker captures registration error dominates and no extraction rule can fix it.
+    Two things measured and NOT the cause: the marker print (50 mm markers read 50.9 / 52.1 mm; a fit-to-page shrink
+    would read UNDER 50), and depth scale (+1.7 %% / +4.2 %% — real, but in-plane size comes from the MARKERS when
+    frames are marker-placed, so calibrating it moved the tape 0.5 mm). `_build_multi_session` has a marker-based
+    depth-scale calibration behind `TC_DEPTH_CAL=1`, OFF by default, reported as `scan_meta.depth_scale`; it only
+    matters for heights and for pose/matching-placed frames.
+    NEXT LEVER (not yet built): on tall tools take the footprint at mid-height (where the sensor is right) rather than
+    at the ramp's shoulder — or trim the traced edge inward by half the measured edge rise (~1 mm/side), which
+    `_trim_rim_half_height` already does for the photo path. Score any attempt on: tape = 89.5 +- 0.5, rule = 25.0
+    +- 0.5. Synthetic complex_tools area errors are +19 %% in the same direction, so a fix should improve both.
+    **Outline cleaning (2026-09-23, Nolan: outlines "not smooth, too many vertexes, and not understanding the overall
+    shape")**: `geometry.clean_ring(pts_mm, tol)` now finishes every topographic outline (hooked into `smooth_polygon`
+    via `clean_tol_mm`, and into `topo_polygon`'s fallback path, which used to skip all cleaning — two real tools kept
+    every vertex because of that). It re-expresses the trace as the shape a person would draw: corners found on a
+    2 mm-smoothed copy (signed turn summed over +-2 mm, peaks >= 38 deg, >= 3 mm apart, so noise cancels while a real
+    corner accumulates); between corners each run becomes a straight line (2 points), a circular arc (Kasa fit,
+    sampled by sagitta), or a smoothed curve + Douglas-Peucker — all within `tol` = min(0.5, max(0.35, 0.6*sigma)) mm
+    (`TC_CLEAN_TOL`; a NEGATIVE value disables and restores the old 0.15 mm approxPolyDP, which is why there were so
+    many vertices: 0.15 mm is finer than the sensor's ~2 mm edge response, so every pixel wiggle survived as geometry).
+    Two rules that mattered: (1) STRAIGHTNESS IS JUDGED ON THE BOW, NOT THE WOBBLE — low-pass the signed chord
+    deviation over ~3 mm; a wall's wobble cancels, an arc's sagitta does not; accept a line when the bow is within tol
+    even if raw wobble is 3x that (same idea for arcs' radial residual). Before this, `straighten_ring`'s 0.18 mm p95
+    guard refused every real wall. (2) where two lines meet, the corner is the INTERSECTION of the fitted lines — the
+    smoothed apex sits ~0.3 mm inside, which on a rectangle is a 0.3 mm inset of every side. Fitting smoothness scales
+    with tol (a fixed 1 mm ate 5 mm shaft tips: hex key -0.06 IoU). Measured: synthetic 100x40 rect -> 5 vertices,
+    100.06 x 40.02 mm; L-shape -> its 6 vertices, IoU 0.998; circle r=30 -> 28 points, radius to 0.01 mm.
+    complex_tools known-truth mean IoU 0.765 -> 0.768 (no tool worse than -0.003), arc harness 0.911 -> 0.910; real
+    drawer 136c77400c3f: 824 -> 337 vertices with every area within +-0.4 %. What it correctly does NOT hide: the steel
+    rule keeps ~110 points because its fused edge genuinely wanders ~1 mm in slow waves over 330 mm — that is
+    one-marker frame rotation error upstream (registration), not tracing noise; for a known-straight tool the Simple
+    shape -> Rectangle fit is the right tool.
     **What the residual roughness actually IS (2026-09-21, measured, worth reading before "improving" it again).**
     High-frequency wobble is ALREADY SMALL: true perpendicular deviation from a 4 mm-smoothed ring is 0.11-0.28 mm
     rms across all seven tools on the real drawer. So generic smoothing and primitive fitting have nothing left to
