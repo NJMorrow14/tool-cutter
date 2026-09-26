@@ -79,10 +79,8 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const [splitArm, setSplitArm] = useState(false);
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
-  const [inspector, setInspector] = useState<'tools' | 'edit'>('tools');
   const [query, setQuery] = useState('');
   const [recovery, setRecovery] = useState<Tool[] | null>(null);
-  useEffect(() => { if (selectedId) setInspector('edit'); }, [selectedId]);
   const [error, setError] = useState<string | null>(null);
   // refine_with_sam is only ever the no-height fallback now; it is never offered as a choice.
   const [autoOpts, setAutoOpts] = useState({ mode: 'auto' as 'auto' | 'color' | 'height', min_area_mm2: 200, height_threshold_mm: 2, refine_with_sam: !rect.has_height });
@@ -294,7 +292,6 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
       setRecovery(mine.length ? mine : null);
       setTools((prev) => (replace ? [...prev.filter((t) => t.session_id !== session.id), ...found] : [...prev, ...found]));
       setSelectedId(null);
-      setInspector('tools');
       setAutoOpen(false);
       if (res.sam_error) setError(`Detected by ${res.mode}; photo refinement unavailable (${res.sam_error}).`);
     } catch (err) {
@@ -468,8 +465,10 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   // ------------------------------------------------------------------ keyboard
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
+      if ((e.target as HTMLElement)?.closest('input, textarea, select, [contenteditable=true]')) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+      if (e.key.toLowerCase() === 'v' && !e.metaKey && !e.ctrlKey) { setDrawKind(null); setSplitArm(false); return; }
+      if (e.key === 'Escape') { setDrawKind(null); setSplitArm(false); }
       // Escape must still clear combine ticks when no tool is being edited, so the guard allows that case
       // through; every branch below that needs a tool checks for one.
       if (!selected && !combineIds.length) return;
@@ -487,7 +486,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
       else if (e.key === '[') rotateSel(-1);
       else if (e.key === ']') rotateSel(1);
       else if (e.key.toLowerCase() === 'a' && (e.metaKey || e.ctrlKey)) { setSel(new Set(editable.polygon_px.map((_, i) => i))); e.preventDefault(); }
-      else if (e.key.toLowerCase() === 'f') fitTo(editable.polygon_px);
+
     };
     window.addEventListener('keydown', down);
     return () => window.removeEventListener('keydown', down);
@@ -498,69 +497,13 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const imported = tools.length - mine.length;
 
   return (
-    <div className={st.layoutGrid}>
-      <div className={st.stageWrap}>
-        <div className={st.toolbar}>
-          <label className={ed.slider} title="How far along the outline a dragged point carries its neighbours. 0 = move that one point only. The wheel changes it while you drag.">
-            <span className={ui.label}>Reshape radius</span>
-            <input type="range" min={0} max={120} step={1} value={softMm} disabled={!editable} onChange={(e) => setSoftMm(Number(e.target.value))} />
-            <span className={ui.unit}>{softMm ? `${softMm} mm` : 'off'}</span>
-          </label>
-          <div className={ui.segmented} role="group" aria-label="Drawing tools" title="Drag on the mat to draw a shape (Shift = square, Alt = corner-to-corner for circles)">
-            {([[null, '↖'], ['rect', '▭'], ['slot', '⬭'], ['circle', '○'], ['hex', '⬡']] as [Exclude<ShapeKind, 'poly'> | null, string][]).map(([k, icon]) => (
-              <button key={icon} type="button" className={drawKind === k ? ui.segActive : ''} onClick={() => setDrawKind(k)}
-                aria-pressed={drawKind === k} title={k ? `Draw a ${k}` : 'Select / edit'}>{icon} {k === null ? 'Select' : k === 'rect' ? 'Rectangle' : k === 'circle' ? 'Circle' : k === 'slot' ? 'Slot' : 'Hex'}</button>
-            ))}
-          </div>
-          <span className={st.toolbarSpacer} />
-          <button type="button" className={ui.btn} disabled={!hist?.past.length} onClick={undo} title="Undo outline edit (⌘/Ctrl Z)">↶ Undo</button>
-          <button type="button" className={ui.btn} disabled={!hist?.future.length} onClick={redo} title="Redo outline edit (⌘/Ctrl Shift Z)">↷ Redo</button>
-        </div>
-        <div className={ed.guidance} aria-live="polite">
-          <div><strong>{drawKind ? `Draw a ${drawKind === 'rect' ? 'rectangle' : drawKind}` : selected ? `Editing ${selected.name}` : drawn.length ? 'Choose an outline to refine' : 'Your scan is ready'}</strong>
-          {drawKind ? 'Drag across the mat. Choose Select when you are finished.' : selected ? 'Drag an edge handle to reshape. Changes can be undone.' : drawn.length ? 'Select a tool on the canvas or in the tool list.' : 'Start with Detect tools, or click a tool on the scan to outline it.'}</div>
-          <span>Drag to orbit · scroll to zoom · right-drag to pan</span>
-        </div>
-        {session.scan?.photo_coverage && <details className={ui.disclosure}>
-          <summary>Photo coverage · {Math.round(session.scan.photo_coverage.covered_fraction * 100)}% of drawer · {session.scan.photo_coverage.photo_count} photos</summary>
-          <p className={ui.hint}>Green: overlapping views. Amber: one view or partial overlap. Red: missing coverage. Add overlapping photos over red or amber areas before cutting.</p>
-          <div role="img" aria-label="Drawer photo coverage, from top left to bottom right" style={{ display: 'grid', gridTemplateColumns: `repeat(${session.scan.photo_coverage.cols}, 1fr)`, gap: 3, gridTemplateRows: `repeat(${session.scan.photo_coverage.rows}, 1fr)`, width: Math.min(600, 220 * (session.mat_mm?.width || 1) / (session.mat_mm?.height || 1)), maxWidth: '100%', aspectRatio: `${session.mat_mm?.width || 1} / ${session.mat_mm?.height || 1}` }}>
-            {session.scan.photo_coverage.covered.flatMap((row, y) => row.map((coverage, x) => <span key={`${x}-${y}`} title={`Row ${y + 1}, column ${x + 1}: ${Math.round(coverage * 100)}% covered`} style={{ minHeight: 0, borderRadius: 3, background: coverage < .95 ? '#dc735e' : session.scan!.photo_coverage!.overlap[y][x] < .5 ? '#e0b551' : '#5b966b' }} />))}
-          </div>
-          <p className={ui.hint}>Coverage confirms where photos exist; it does not certify focus or dimensional accuracy.</p>
-        </details>}
-        {recovery && <div className={ed.notice} role="status"><span>Previous tool list available.</span><button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => { setTools(prev => [...prev.filter(t => t.session_id !== session.id), ...recovery]); setRecovery(null); setSelectedId(null); }}>Undo list change</button><button className={ui.iconBtn} aria-label="Dismiss undo message" onClick={() => setRecovery(null)}>×</button></div>}
-        <ScanViewer session={session} tools={[...mine, ...shapes]} selectedId={selectedId} onSelect={(id) => selectTool(id)} softMm={softMm}
-          tickedIds={combineIds} onToggleSelect={toggleCombine}
-          edit={{
-            onEditStart: (id) => { const t = tools.find((x) => x.id === id); if (t) record(t); },
-            onEdit: (id, poly) => commit(id, poly, false),
-            onCreate: (x, y) => {
-              if (!canClick) { setError('Click-to-outline needs scan height data or the HQ-SAM checkpoint. Use Auto-detect instead.'); return; }
-              addTool([{ x: Math.round(x), y: Math.round(y), label: 'pos' }], null);
-            },
-            onHint: (id, x, y, label) => updateTool(id, (t) => ({ ...t, points: [...t.points, { x: Math.round(x), y: Math.round(y), label }] })),
-            onSplit: (id, line) => { const t = tools.find((x) => x.id === id); if (t) void doSplit(t, line); },
-            onDrawShape: (a, bpt, mods) => {
-              if (!drawKind) return;
-              const made = shapeFromDrag(drawKind, a, bpt, mods);
-              if (!made) return;
-              setTools((prev) => [...prev, shapeTool(made.spec, 20, tools, made.at)]);   // stays armed: draw several in a row
-            },
-          }} drawArmed={drawKind !== null} splitArmed={splitArm} />
-        {error && <div role="alert" className={ui.error}>{error}</div>}
-      </div>
-
-      <aside className={`${ui.panel} ${ed.inspector}`} aria-label="Outline inspector">
-        <div className={ed.inspectorTabs} role="tablist" aria-label="Inspector">
-          <button type="button" role="tab" aria-selected={inspector === 'tools'} onClick={() => setInspector('tools')}>Tools <span className={ui.badge}>{mine.length}</span></button>
-          <button type="button" role="tab" aria-selected={inspector === 'edit'} onClick={() => setInspector('edit')}>Edit outline</button>
-        </div>
+    <div className={ed.modelingGrid}>
+      <aside className={`${ui.panel} ${ed.inspector} ${ed.outliner}`} aria-label="Scene objects">
+        <div className={ed.dockTitle}>Scene <span>{mine.length + shapes.length} objects</span></div>
         <div className={ed.inspectorBody}>
-        {inspector === 'tools' && <>
         <div className={ui.section}>
           <div className={ui.rowBetween}>
-            <h2 className={ui.panelTitle}>Auto-detect</h2>
+            <h2 className={ui.panelTitle}>Scan actions</h2>
             <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnGhost}`} onClick={() => setAutoOpen(!autoOpen)}
               aria-expanded={autoOpen} title={autoOpen ? 'Hide detection settings' : 'Show detection settings'}>{autoOpen ? 'Hide settings' : 'Settings'}</button>
           </div>
@@ -608,7 +551,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
         </div>
 
         <div className={ui.section}>
-          <div className={ui.rowBetween}>
+          <div className={`${ui.rowBetween} ${ed.sceneHeading}`}>
             <h2 className={ui.panelTitle}>Tools ({mine.length})</h2>
             <span className={ui.row} style={{ gap: 6 }}>
               {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Replace every traced outline with the simple shape that fits it best" onClick={simplifyAll}>◻ Shapes</button>}
@@ -638,7 +581,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           <input className={ui.input} type="search" placeholder="Search tools…" aria-label="Search tools" value={query} onChange={e => setQuery(e.target.value)} />
           <div className={ui.list}>
             {mine.filter(t => t.name.toLowerCase().includes(query.toLowerCase())).map((t) => (
-              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
+              <div key={t.id} className={`${ui.toolRow} ${ed.sceneRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
                    style={combineIds.includes(t.id) ? { outline: '2px solid var(--accent, #f26a1b)', outlineOffset: '-2px' } : undefined}
                    onClick={(e) => (e.metaKey || e.ctrlKey || e.shiftKey) ? toggleCombine(t.id) : selectTool(t.id, true)}>
                 <span className={ui.swatch} style={{ background: t.color }} />
@@ -675,8 +618,65 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           )}
         </div>
 
-        </>}
-        {inspector === 'edit' && (selected ? (
+        {session.scan?.photo_coverage && <details className={ui.disclosure}>
+          <summary>Photo coverage · {Math.round(session.scan.photo_coverage.covered_fraction * 100)}% of drawer · {session.scan.photo_coverage.photo_count} photos</summary>
+          <p className={ui.hint}>Green: overlapping views. Amber: one view or partial overlap. Red: missing coverage. Add overlapping photos over red or amber areas before cutting.</p>
+          <div role="img" aria-label="Drawer photo coverage, from top left to bottom right" style={{ display: 'grid', gridTemplateColumns: `repeat(${session.scan.photo_coverage.cols}, 1fr)`, gap: 3, gridTemplateRows: `repeat(${session.scan.photo_coverage.rows}, 1fr)`, width: Math.min(600, 220 * (session.mat_mm?.width || 1) / (session.mat_mm?.height || 1)), maxWidth: '100%', aspectRatio: `${session.mat_mm?.width || 1} / ${session.mat_mm?.height || 1}` }}>
+            {session.scan.photo_coverage.covered.flatMap((row, y) => row.map((coverage, x) => <span key={`${x}-${y}`} title={`Row ${y + 1}, column ${x + 1}: ${Math.round(coverage * 100)}% covered`} style={{ minHeight: 0, borderRadius: 3, background: coverage < .95 ? '#dc735e' : session.scan!.photo_coverage!.overlap[y][x] < .5 ? '#e0b551' : '#5b966b' }} />))}
+          </div>
+          <p className={ui.hint}>Coverage confirms where photos exist; it does not certify focus or dimensional accuracy.</p>
+        </details>}
+        </div>
+      </aside>
+      <div className={`${st.stageWrap} ${ed.modelingViewport}`}>
+        <div className={st.toolbar}>
+          <div className={ui.segmented} role="group" aria-label="Drawing tools" title="Drag on the mat to draw a shape (Shift = square, Alt = corner-to-corner for circles)">
+            {([[null, '↖'], ['rect', '▭'], ['slot', '⬭'], ['circle', '○'], ['hex', '⬡']] as [Exclude<ShapeKind, 'poly'> | null, string][]).map(([k, icon]) => (
+              <button key={icon} type="button" className={drawKind === k ? ui.segActive : ''} onClick={() => setDrawKind(k)}
+                aria-pressed={drawKind === k} title={k ? `Draw a ${k}` : 'Select / edit (V)'}>{icon} {k === null ? 'Select' : k === 'rect' ? 'Rectangle' : k === 'circle' ? 'Circle' : k === 'slot' ? 'Slot' : 'Hex'}</button>
+            ))}
+          </div>
+          <span className={st.toolbarSpacer} />
+          <button type="button" className={ui.btn} disabled={!hist?.past.length} onClick={undo} aria-label="Undo outline edit" title="Undo outline edit (⌘/Ctrl Z)">↶</button>
+          <button type="button" className={ui.btn} disabled={!hist?.future.length} onClick={redo} aria-label="Redo outline edit" title="Redo outline edit (⌘/Ctrl Shift Z)">↷</button>
+        </div>
+        <div className={ed.guidance} aria-live="polite">
+          <div><strong>{drawKind ? `Draw a ${drawKind === 'rect' ? 'rectangle' : drawKind}` : selected ? `Editing ${selected.name}` : drawn.length ? 'Choose an outline to refine' : 'Your scan is ready'}</strong>
+          {drawKind ? 'Drag across the mat. Choose Select when you are finished.' : selected ? 'Drag an edge handle to reshape. Changes can be undone.' : drawn.length ? 'Select a tool on the canvas or in the tool list.' : 'Start with Detect tools, or click a tool on the scan to outline it.'}</div>
+          <span>Drag to orbit · scroll to zoom · right-drag to pan</span>
+        </div>
+        {recovery && <div className={ed.notice} role="status"><span>Previous tool list available.</span><button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => { setTools(prev => [...prev.filter(t => t.session_id !== session.id), ...recovery]); setRecovery(null); setSelectedId(null); }}>Undo list change</button><button className={ui.iconBtn} aria-label="Dismiss undo message" onClick={() => setRecovery(null)}>×</button></div>}
+        <ScanViewer session={session} tools={[...mine, ...shapes]} selectedId={selectedId} onSelect={(id) => selectTool(id)} softMm={softMm}
+          tickedIds={combineIds} onToggleSelect={toggleCombine}
+          edit={{
+            onEditStart: (id) => { const t = tools.find((x) => x.id === id); if (t) record(t); },
+            onEdit: (id, poly) => commit(id, poly, false),
+            onCreate: (x, y) => {
+              if (!canClick) { setError('Click-to-outline needs scan height data or the HQ-SAM checkpoint. Use Auto-detect instead.'); return; }
+              addTool([{ x: Math.round(x), y: Math.round(y), label: 'pos' }], null);
+            },
+            onHint: (id, x, y, label) => updateTool(id, (t) => ({ ...t, points: [...t.points, { x: Math.round(x), y: Math.round(y), label }] })),
+            onSplit: (id, line) => { const t = tools.find((x) => x.id === id); if (t) void doSplit(t, line); },
+            onDrawShape: (a, bpt, mods) => {
+              if (!drawKind) return;
+              const made = shapeFromDrag(drawKind, a, bpt, mods);
+              if (!made) return;
+              setTools((prev) => [...prev, shapeTool(made.spec, 20, tools, made.at)]);   // stays armed: draw several in a row
+            },
+          }} drawArmed={drawKind !== null} splitArmed={splitArm} />
+        {error && <div role="alert" className={ui.error}>{error}</div>}
+      </div>
+
+      <aside className={`${ui.panel} ${ed.inspector} ${ed.properties}`} aria-label="Object properties">
+        <div className={ed.dockTitle}>Properties <span>{selected ? 'Outline' : 'No selection'}</span></div>
+        <div className={ed.inspectorBody}>
+          <label className={ed.slider} title="How far along the outline a dragged point carries its neighbours. 0 = move that one point only. The wheel changes it while you drag.">
+            <span className={ui.label}>Reshape radius</span>
+            <input type="range" min={0} max={120} step={1} value={softMm} disabled={!editable} onChange={(e) => setSoftMm(Number(e.target.value))} />
+            <span className={ui.unit}>{softMm ? `${softMm} mm` : 'off'}</span>
+          </label>
+        {selected ? (
+
           <div className={ui.section}>
             <h2 className={ui.panelTitle}>Edit outline</h2>
             <label className={ui.label}>Tool name<input className={ui.input} value={selected.name} onChange={e => updateTool(selected.id, t => ({ ...t, name: e.target.value }), false)} /></label>
@@ -770,7 +770,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           <div className={ui.section}>
             <p className={ui.hint}>Click a tool on the image to fix its outline by hand, or click bare mat to outline something the detector missed.</p>
           </div>
-        ))}
+        )}
         </div>
         <div className={ed.footer}>
           <p>{ready ? `${ready} outline${ready === 1 ? '' : 's'} ready for the foam layout` : 'Add at least one outline to continue'}</p>

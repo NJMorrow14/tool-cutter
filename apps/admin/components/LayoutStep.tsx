@@ -296,8 +296,8 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
   const set = (patch: Partial<LayoutSettings>) => setSettings({ ...settings, ...patch });
 
   return (
-    <div className={st.layoutGrid}>
-      <div className={st.stageWrap}>
+    <div className={`${st.layoutGrid} ${ed.layoutWorkspace}`}>
+      <div className={`${st.stageWrap} ${ed.modelingViewport}`}>
         <div className={st.toolbar}>
           <div className={ui.segmented} role="group" aria-label="Pocket drawing tools" title="Draw a pocket on the sheet: V select · 1 rectangle · 2 slot · 3 circle · 4 hexagon · 5 polygon">
             {([[null, '↖', 'Select / move (V)'], ['rect', '▭', 'Rectangle: drag corner to corner (Shift = square) (1)'], ['slot', '⬭', 'Slot: drag corner to corner (2)'], ['circle', '○', 'Circle: drag from centre (Alt = corner to corner) (3)'], ['hex', '⬡', 'Hexagon: drag from centre (4)'], ['poly', '⬠', 'Polygon: click points, click the first point or press Enter to close (5)']] as [ShapeKind | null, string, string][]).map(([k, icon, tip]) => (
@@ -352,7 +352,7 @@ export default function LayoutStep({ hasHeight, onObjectUploaded, tools, setTool
         )}
         <svg ref={svgRef} className={st.sheet} viewBox={`${vb.x} ${vb.y} ${vb.w} ${vb.h}`} style={{ aspectRatio: `${vb.w} / ${vb.h}`, cursor: drawTool || notchMode ? 'crosshair' : drag ? 'grabbing' : 'default', display: view3d ? 'none' : undefined }}
           onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onPointerDown={onSheetDown} onDoubleClick={() => { if (drawTool === 'poly' && polyPts.length >= 3) finishPolygon(polyPts.slice(0, -1).length >= 3 ? polyPts.slice(0, -1) : polyPts); }}>
-          <rect x={vb.x} y={vb.y} width={vb.w} height={vb.h} fill="#f8fafc" />
+          <rect x={vb.x} y={vb.y} width={vb.w} height={vb.h} fill="#20242b" />
           <rect x={0} y={0} width={mat.width_mm} height={mat.height_mm} fill="#fff" stroke="#111827" strokeWidth={0.4} />
           {gridLines.map((v) => (
             <g key={v} stroke="#e5e7eb" strokeWidth={0.2}>

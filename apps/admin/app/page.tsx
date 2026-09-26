@@ -86,9 +86,9 @@ export default function Page() {
   const uploadHint = session ? session.filename : objectCount ? `${objectCount} tool model${objectCount > 1 ? 's' : ''}` : 'Layout scan or tool model';
   const steps: StepDef[] = useMemo(
     () => [
-      { id: 'upload', title: 'Capture', hint: uploadHint, enabled: true, done: !!session || objectCount > 0 },
-      { id: 'calibrate', title: 'Set scale', hint: session?.rectified ? `${session.mat_mm?.width} × ${session.mat_mm?.height} mm` : 'Mark the mat corners + size', enabled: !!session, done: !!session?.rectified },
-      { id: 'outlines', title: 'Outlines', hint: readyTools ? `${readyTools} tool${readyTools > 1 ? 's' : ''}${editedTools ? `, ${editedTools} hand-edited` : ''}` : 'Find tools and refine their edges', enabled: !!session?.rectified, done: readyTools > 0 },
+      { id: 'upload', title: 'Import', hint: uploadHint, enabled: true, done: !!session || objectCount > 0 },
+      { id: 'calibrate', title: 'Calibration', hint: session?.rectified ? `${session.mat_mm?.width} × ${session.mat_mm?.height} mm` : 'Mark the mat corners + size', enabled: !!session, done: !!session?.rectified },
+      { id: 'outlines', title: 'Model', hint: readyTools ? `${readyTools} tool${readyTools > 1 ? 's' : ''}${editedTools ? `, ${editedTools} hand-edited` : ''}` : 'Find tools and refine their edges', enabled: !!session?.rectified, done: readyTools > 0 },
       { id: 'layout', title: 'Layout & export', hint: 'Arrange pockets and download', enabled: readyTools > 0, done: false },
     ],
     [session, readyTools, editedTools, objectCount, uploadHint],
@@ -96,11 +96,11 @@ export default function Page() {
   const hasHeight = !!session?.rectified?.has_height || tools.some((t) => t.measured_thickness_mm !== null);
 
   return (
-    <main className={styles.shell}>
+    <main className={`${styles.shell} ${styles.modelingShell}`} data-workspace={step}>
       <header className={styles.header}>
         <div className={styles.brand}>
-          <h1>Foam studio</h1>
-          <span>From your tools to a precisely fitted insert.</span>
+          <h1>Foam Studio</h1>
+          <span>{session?.filename || 'Untitled workspace'}</span>
         </div>
         <div className={styles.status}>
           <span className={`${styles.dot} ${backendOk === null ? '' : backendOk ? (model?.available ? styles.dotOk : styles.dotWarn) : styles.dotBad}`} />

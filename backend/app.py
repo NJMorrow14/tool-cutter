@@ -248,11 +248,25 @@ def _topo_tool_result(s, tool_id: str, mask: np.ndarray, points: List[Dict], box
                       signed: Optional[np.ndarray] = None) -> Dict:
     """Tool from a topographic footprint mask (no photo involved). `signed` is topo_footprint's
     height-minus-keep-level field, which puts the outline on the sub-pixel edge instead of on pixel corners."""
+    # Hairline spikes and notches (1-2 px wide, several mm long) are below anything the sensor can resolve, and
+    # contour-domain smoothing cannot remove them: a spike is thin in WIDTH but long along the CONTOUR (out and back),
+    # so along-the-curve filters treat it as a feature. Nolan's screwdriver knob (2026-09-23) carried a 4.7 mm hair
+    # that survived three rounds of polygon cleaning and showed as a "razor tooth". Mask morphology sees it for what
+    # it is: open removes slivers narrower than HAIR_MM, close fills notches narrower than that. Both are well under
+    # the 6 mm shaft of the thinnest tool and the 2 mm inner-corner limit noted for reconnection closings.
+    mask = geometry.remove_hairs(mask, s.mm_per_px, HAIR_MM)
     stats = scanmod.measure_thickness(s.rect_height, mask) if (s.rect_height is not None and mask.any()) else None
     # the edge wobbles at roughly the depth-sensor cell size, so smooth at that scale, not the raster's;
     # straighten_ring then snaps the straight runs back, so corners come from intersecting runs, not rounding
     poly = geometry.topo_polygon(mask, s.mm_per_px, signed=signed,
                                  sigma_mm=max(1.0, TOPO_SMOOTH_CELLS * _depth_cell_mm(s)))
+    # Calibrated on the FRONT TrueDepth camera only (tape 92.1 -> 89.5). The rear LiDAR's edge ramp is different:
+    # applying the same trim there cost the arc harness 0.906 -> 0.870 IoU and added a smoke failure, so the trim
+    # is gated to TrueDepth captures until it is made self-calibrating from the measured ramp.
+    sensors = (s.scan_meta or {}).get("sensors") or []
+    if poly is not None and s.rect_height is not None and EDGE_TRIM_MM > 0 \
+            and any(str(x).startswith("truedepth") for x in sensors):
+        poly = geometry.trim_edge_bias(poly, s.rect_height, s.mm_per_px, trim_mm=EDGE_TRIM_MM)
     area_px = float(cv2.contourArea(poly.astype(np.float32))) if poly is not None else float(mask.sum())
     res: Dict[str, Any] = {
         "id": tool_id, "session_id": s.id, "points": points, "box": box,
@@ -916,6 +930,13 @@ REFIT_LOW_MM = float(os.environ.get("TC_REFIT_LOW_MM", "8.0"))   # re-fit blobs 
 # A detected tool must be at least this tall at its 90th percentile. Bare mat reads 0.08 mm (p90) on a clean
 # scan and up to 3.4 mm (p99) over an ArUco marker; a real 3 mm steel rule reads 2.5 mm. TC_TOOL_MIN_H overrides.
 TOOL_MIN_HEIGHT_MM = float(os.environ.get("TC_TOOL_MIN_H", "1.5"))
+# Mask features thinner than this are hairs (sub-resolution slivers/notches), removed before an outline is traced.
+HAIR_MM = float(os.environ.get("TC_HAIR_MM", "1.6"))
+# Outward edge bias of the depth sensor on a tall wall, trimmed back per vertex (0 below 3 mm, full above 15 mm).
+# Fitted to calipers: tape measure traced 92.1 (after hair removal) vs 89.5 true = 1.3 mm per side. TC_EDGE_TRIM_MM=0 disables.
+EDGE_TRIM_MM = float(os.environ.get("TC_EDGE_TRIM_MM", "1.3"))
+# The marker exclusion zone may erase pixels only up to this height: paper, even folded, is not this tall.
+MARKER_MASK_MAX_MM = float(os.environ.get("TC_MARKER_MASK_MAX_MM", "5.0"))
 TOPO_SMOOTH_CELLS = float(os.environ.get("TC_TOPO_SMOOTH", "1.0"))   # outline smoothing, in depth cells
 MIN_SHIFT_GAIN = float(os.environ.get("TC_MIN_GAIN", "1.0"))    # never apply a shift that fits WORSE than standing still
 APPLY_SHIFT_MAX_MM = float(os.environ.get("TC_APPLY_MAX_MM", "8.0"))   # ...nor one too big to be drift (see below)
@@ -2004,7 +2025,14 @@ def _marker_mask(s) -> np.ndarray:
                 quad = center + 1.5 * (quad - center)
                 cv2.fillConvexPoly(mask, np.rint(quad).astype(np.int32), 1)
     radius = max(1, int(round(1. / s.mm_per_px)))
-    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) > 0
+    out = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) > 0
+    # The zone is PAPER, and paper reads ~0 mm (a folded edge, 2-4 mm). Anything taller under it is a tool that
+    # happens to sit next to a marker, and erasing it carves a rectangular notch out of the tool: Nolan's hammer
+    # (2026-09-23, capture b59fc5fdd2d1) lost the corner of its striking face this way — 4.8 cm2 of a 28 mm-tall
+    # head zeroed by the top-left marker's quiet border. Keep the mask only where the height says paper.
+    if s.rect_height is not None:
+        out &= ~(np.nan_to_num(s.rect_height, nan=0.0) > MARKER_MASK_MAX_MM)
+    return out
 
 
 def _detect_photo_tools(s, body):

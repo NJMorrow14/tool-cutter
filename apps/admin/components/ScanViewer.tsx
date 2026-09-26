@@ -92,7 +92,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, ticke
         root.add(mesh);
         state.surface = mesh;
         // mat plane and grid under the scan
-        const floor = new THREE.Mesh(new THREE.PlaneGeometry(hf.width_mm * 1.3, hf.height_mm * 1.3), new THREE.MeshStandardMaterial({ color: 0xd1d5db, roughness: 1 }));
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(hf.width_mm * 1.3, hf.height_mm * 1.3), new THREE.MeshStandardMaterial({ color: 0x303640, roughness: 1 }));
         floor.position.set(hf.width_mm / 2, hf.height_mm / 2, -0.6);
         root.add(floor);
         root.updateMatrixWorld(true);
@@ -176,7 +176,7 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, ticke
       t.polygon_mm.forEach((v, i) => { const d = Math.hypot(v[0] - p.x, v[1] - p.y); if (d < bd) { bd = d; best = i; } });
       if (best < 0) return;
       const { arc, per } = arcLengths(t.polygon_mm);
-      const z0 = sampleHeight(state.hf, t.polygon_mm[best][0], t.polygon_mm[best][1]) * zRef.current;
+      const z0 = 0.8;                                  // handles sit on the mat now; drag on that plane
       const from = localAt(e, z0);
       if (!from) return;
       hdrag = { id: t.id, anchor: best, poly0: t.polygon_mm, arc, per, from, z0 };
@@ -301,41 +301,76 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, ticke
     s.controls.update();
   };
 
+  const perspective = () => {
+    const s = sceneRef.current;
+    if (!s?.hf) return;
+    overhead();
+    const distance = s.camera.position.distanceTo(s.controls.target);
+    s.camera.position.copy(s.controls.target).add(new THREE.Vector3(.55, .85, .7).normalize().multiplyScalar(distance));
+    s.camera.lookAt(s.controls.target);
+    s.controls.update();
+  };
+  const frameSelection = () => {
+    const s = sceneRef.current;
+    const tool = tools.find(t => t.id === selectedId);
+    if (!s?.hf || !tool || !tool.polygon_mm.length) { overhead(); return; }
+    const points = placed(tool);
+    const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const centre = s.root.localToWorld(new THREE.Vector3((x0+x1)/2, (y0+y1)/2, sampleHeight(s.hf, (x0+x1)/2, (y0+y1)/2)));
+    const span = Math.max(30, y1-y0, (x1-x0)/s.camera.aspect);
+    const distance = span / (2 * Math.tan(THREE.MathUtils.degToRad(s.camera.fov / 2))) * 1.6;
+    const direction = s.camera.position.clone().sub(s.controls.target).normalize();
+    s.camera.position.copy(centre).addScaledVector(direction, distance);
+    s.controls.target.copy(centre);
+    s.controls.update();
+  };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || (event.target as HTMLElement)?.closest('input, textarea, select, [contenteditable=true]')) return;
+      if (event.key.toLowerCase() === 'f') { event.preventDefault(); frameSelection(); }
+      if (event.key === '1') overhead();
+      if (event.key === '3') perspective();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
   const rebuildOutlines = () => {
     const s = sceneRef.current;
     if (!s || !s.hf) return;
     disposeObject(s.outlines);
     s.outlines.clear();
-    const z = zRef.current;
     for (const t of toolsRef.current) {
       if (t.polygon_mm.length < 3) continue;
       const sel = t.id === selectedRef.current;
       const ticked = tickedRef.current.includes(t.id);
-      const pts: THREE.Vector3[] = [];
       const poly = placed(t);
-      for (let i = 0; i < poly.length; i++) {
-        const a = poly[i], b = poly[(i + 1) % poly.length];
-        const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / 2));
-        for (let k = 0; k < n; k++) {
-          const x = a[0] + ((b[0] - a[0]) * k) / n, y = a[1] + ((b[1] - a[1]) * k) / n;
-          pts.push(new THREE.Vector3(x, y, sampleHeight(s.hf, x, y) * z + 0.8));
-        }
-      }
+      // The outline is the FOOTPRINT — where the cutter goes — so it is drawn ON THE MAT, not draped up the tool.
+      // Draping it on the surface put the line on a near-vertical wall, where the 2 mm height grid turns a 0.3 mm
+      // lateral wobble into centimetres of vertical zigzag (Nolan, 2026-09-23: "still very rocky" after the 2D shape
+      // was fixed). Measured on the tape measure: bilinear drape 2.2 mm step-to-step, floor-side sampling 1.95 mm
+      // — no sampling scheme follows a cliff on that grid. A planar line has zero roughness by construction and reads
+      // as what it is. depthTest off so the far side is not swallowed by the tool body it sits against.
+      const LIFT = 0.8;
+      const pts = poly.map(([x, y]) => new THREE.Vector3(x, y, LIFT));
       const geom = new THREE.BufferGeometry().setFromPoints(pts);
-      const line = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color(sel ? '#ffffff' : ticked ? '#f26a1b' : t.color), linewidth: 1 }));
+      const flat = (color: string, opacity = 1) => new THREE.LineBasicMaterial({ color: new THREE.Color(color), linewidth: 1, transparent: opacity < 1, opacity, depthTest: false });
+      const line = new THREE.LineLoop(geom, flat(sel ? '#ffffff' : ticked ? '#f26a1b' : t.color));
+      line.renderOrder = 2;
       s.outlines.add(line);
       if (ticked && !sel) {          // a gathered tool gets the same double-line emphasis as the selected one
-        const mark = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color('#f26a1b'), transparent: true, opacity: 0.9 }));
-        mark.position.z = 1.6;
+        const mark = new THREE.LineLoop(geom, flat('#f26a1b', 0.9));
+        mark.position.z = 0.8; mark.renderOrder = 2;
         s.outlines.add(mark);
       }
       if (sel) {
-        const glow = new THREE.LineLoop(geom, new THREE.LineBasicMaterial({ color: new THREE.Color(t.color), transparent: true, opacity: 0.9 }));
-        glow.position.z = 1.6;
+        const glow = new THREE.LineLoop(geom, flat(t.color, 0.9));
+        glow.position.z = 0.8; glow.renderOrder = 2;
         s.outlines.add(glow);
         if (editRef.current) {
           // one handle per vertex, drawn as screen-sized points so they stay grabbable at any zoom
-          const hp = placed(t).map(([x, y]) => new THREE.Vector3(x, y, sampleHeight(s.hf!, x, y) * z + 2.2));
+          const hp = poly.map(([x, y]) => new THREE.Vector3(x, y, LIFT + 1.4));
           const pts2 = new THREE.Points(new THREE.BufferGeometry().setFromPoints(hp),
             new THREE.PointsMaterial({ color: 0xffffff, size: 7, sizeAttenuation: false, depthTest: false }));
           pts2.renderOrder = 3;
@@ -392,14 +427,19 @@ export default function ScanViewer({ session, tools, selectedId, onSelect, ticke
 
   return (
     <div className={ed.canvasWrap} ref={hostRef} style={{ position: 'relative' }}>
-      <div className={ed.readout} style={{ top: 10, bottom: 'auto', pointerEvents: 'auto', display: 'flex', flexWrap: 'wrap', maxWidth: 'calc(100% - 20px)', gap: 12, alignItems: 'center' }}>
+      <div className={ed.viewControls} role="toolbar" aria-label="Viewport navigation">
+        <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={overhead} title="Top view · 1">Top <kbd>1</kbd></button>
+        <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={perspective} title="Perspective view · 3">Perspective <kbd>3</kbd></button>
+        <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={frameSelection} title="Frame selected tool, or fit the drawer · F">{selectedId ? 'Frame selected' : 'Fit all'} <kbd>F</kbd></button>
+        <label className={ui.checkbox}><input type="checkbox" checked={showPhoto} onChange={(e) => setShowPhoto(e.target.checked)} /> Texture</label>
+        <label className={ed.slider} title="Exaggerate heights for inspection"><span>Relief</span>
+          <input type="range" min={1} max={4} step={0.5} value={zScale} onChange={(e) => setZScale(Number(e.target.value))} style={{ width: 56 }} /><span>{zScale}×</span></label>
+      </div>
+      <div className={ed.viewportStatus}>
         {status && <span role="status">{status}</span>}
-        <label className={ed.slider} title="Height exaggeration"><span>Relief</span>
-          <input type="range" min={1} max={4} step={0.5} value={zScale} onChange={(e) => setZScale(Number(e.target.value))} style={{ width: 90 }} /><span>{zScale}</span></label>
-        <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Look straight down at the drawer" onClick={overhead}>⤓ Overhead</button>
-        <label className={ui.checkbox} style={{ color: '#e5e7eb' }}><input type="checkbox" checked={showPhoto} onChange={(e) => setShowPhoto(e.target.checked)} /> Show photo</label>
-        <span style={{ color: '#9ca3af' }}>2 mm display grid{coverage !== null && ` · ${Math.round(coverage * 100)}% depth coverage`}</span>
-        {coverage !== null && coverage < .98 && <span style={{ color: '#fcd34d' }}>Gaps have no measured depth. Scan them again from another angle.</span>}
+        <span>mm · 2 mm display grid{coverage !== null && ` · ${Math.round(coverage * 100)}% depth coverage`}</span>
+        <span className={ed.viewHelp}>Drag orbit · Right-drag pan · Scroll zoom</span>
+        {coverage !== null && coverage < .98 && <span style={{ color: '#fcd34d' }}>Unmeasured areas shown as gaps</span>}
       </div>
     </div>
   );

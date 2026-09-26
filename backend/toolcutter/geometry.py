@@ -210,6 +210,13 @@ def _fit_circle(pts: np.ndarray):
     return np.array([cx, cy]), r, float(np.abs(sres).max())
 
 
+TOOTH_MM = float(os.environ.get("TC_TOOTH_MM", "6.0"))              # opposite corners closer than this ...
+TOOTH_DEPTH_MM = float(os.environ.get("TC_TOOTH_DEPTH_MM", "3.0"))  # ... with an excursion shallower than this = a tooth
+SPIKE_MM = float(os.environ.get("TC_SPIKE_MM", "1.2"))              # a sample this far off the smooth curve is a spike
+CURVE_SMOOTH_MM = float(os.environ.get("TC_CURVE_SMOOTH_MM", "1.5"))          # free-curve smoothing, runs 12-30 mm
+CURVE_SMOOTH_LONG_MM = float(os.environ.get("TC_CURVE_SMOOTH_LONG_MM", "2.5"))   # ... and on runs >= 30 mm
+
+
 def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, step: float = 0.5) -> np.ndarray:
     """Re-express a dense traced outline as the shape a person would draw: sharp corners, straight edges as
     two points, round parts as arcs, and anything else as a smoothed curve — every piece within `tol` mm of
@@ -241,7 +248,8 @@ def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, s
     ang = np.arctan2(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0], (d1 * d2).sum(axis=1))   # signed turn per vertex
     w = max(1, int(round(2.0 / step)))
     kernel = np.ones(2 * w + 1)
-    turn = np.abs(np.convolve(np.concatenate([ang[-w:], ang, ang[:w]]), kernel, mode="valid"))   # cyclic window sum
+    turn_s = np.convolve(np.concatenate([ang[-w:], ang, ang[:w]]), kernel, mode="valid")           # cyclic window sum
+    turn = np.abs(turn_s)
     thresh = np.deg2rad(corner_deg)
     gap = max(1, int(round(3.0 / step)))
     corners = []
@@ -256,6 +264,35 @@ def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, s
         lo = np.arange(i - gap, i + gap + 1) % n
         taken[lo] = True
     corners = sorted(corners)
+    # TEETH ARE NOT CORNERS. A real corner on a tool is isolated; a "razor tooth" (Nolan, 2026-09-23, on a screwdriver
+    # knob whose height-map edge was perfectly smooth there) is a PAIR of opposite-turning corners a few mm apart with a
+    # shallow excursion, and classifying the 3-5 mm runs between them as "lines" preserved it as geometry. Drop such
+    # pairs; the run through them then gets the tiered smoothing and the tooth is gone. Real notches survive when they
+    # are wider than TOOTH_MM or deeper than TOOTH_DEPTH_MM — a hammer claw or a socket's square drive is both.
+    changed = True
+    while changed and len(corners) >= 2:
+        changed = False
+        m = len(corners)
+        for k in range(m):
+            a, b = corners[k], corners[(k + 1) % m]
+            if ((b - a) % n) * step >= TOOTH_MM or np.sign(turn_s[a]) == np.sign(turn_s[b]):
+                continue
+            pad = int(round(4.0 / step))
+            i0 = (a - pad) % n
+            span = ((b + pad) - (a - pad)) % n
+            if span < 3 or span >= n - 1:
+                continue
+            idx = np.arange(i0, i0 + span + 1) % n
+            seg = r[idx]
+            c0, c1 = seg[0], seg[-1]
+            L = float(np.linalg.norm(c1 - c0))
+            if L < 1e-6:
+                continue
+            nrm = np.array([-(c1 - c0)[1], (c1 - c0)[0]]) / L
+            if np.abs((seg - c0) @ nrm).max() < TOOTH_DEPTH_MM:
+                corners = [c for j, c in enumerate(corners) if j not in (k, (k + 1) % m)]
+                changed = True
+                break
     if len(corners) < 2:
         # no corners: treat the whole ring as one cyclic free curve
         segs = [np.arange(n)]
@@ -310,12 +347,28 @@ def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, s
             arc = np.column_stack([c[0] + rad * np.cos(th), c[1] + rad * np.sin(th)])
             out.append(arc)
             continue
-        # free curve: smooth along the run (ends pinned), then keep only what tol requires
-        sig = fit_sig
+        # free curve: smooth along the run (ends pinned), then keep only what tol requires.
+        # The sensor's edge response is ~2 mm, so outline detail finer than ~4-5 mm wavelength is noise, not
+        # geometry (Nolan, 2026-09-23: 0.3 mm rms / 0.8 mm p95 zigzags at ~5 mm on a screwdriver handle, "the last
+        # remaining bits of rough edges"). Long runs therefore get a 1.5 mm Gaussian, which shortens a real 10 mm
+        # radius by 0.1 mm (s^2/2R) — well inside tol. SHORT runs (< 12 mm: shaft tips, small features) keep the light
+        # smoothing, because a fixed 1 mm blur measurably ate 5 mm shaft tips (hex key -0.06 IoU).
+        run_len = float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum())
+        # tiered: a 30 mm+ run on a hand tool is a smooth flank, and the residual +-0.5 mm alternation at ~8 mm
+        # wavelength (what still read as "teeth" zoomed in) needs ~2.5 mm to go; s^2/2R on a real R=10 mm is 0.3 mm
+        sig = fit_sig if run_len < 12.0 else max(fit_sig, (CURVE_SMOOTH_MM if run_len < 30.0 else CURVE_SMOOTH_LONG_MM) / step)
         if len(seg) > 6:
             from scipy.ndimage import gaussian_filter1d
             mode = "wrap" if cyclic else "nearest"
             sm = np.column_stack([gaussian_filter1d(seg[:, j], sig, mode=mode) for j in range(2)])
+            # A Gaussian only HALVES a 3 mm-wide, 3 mm-deep spike, and 1.4 mm survives the tolerance. Trace noise is
+            # 0.3 mm rms, so anything > SPIKE_MM off the smoothed curve is an impulse, not the tool: replace those
+            # samples with the smooth estimate and smooth again. Real curves sit within noise of their smoothing.
+            off = np.linalg.norm(seg - sm, axis=1)
+            spike = off > SPIKE_MM
+            if spike.any() and not spike.all():
+                seg2 = seg.copy(); seg2[spike] = sm[spike]
+                sm = np.column_stack([gaussian_filter1d(seg2[:, j], sig, mode=mode) for j in range(2)])
             if not cyclic:
                 sm[0], sm[-1] = seg[0], seg[-1]
         else:
@@ -340,6 +393,9 @@ def clean_ring(pts_mm: np.ndarray, tol: float = 0.4, corner_deg: float = 38.0, s
                     x = c1 + t * d1_
                     if np.linalg.norm(x - out[k][0]) <= 3.0:     # never let a near-parallel pair fly off
                         out[k] = out[k].copy(); out[k][0] = x
+    if os.environ.get("TC_CLEAN_DEBUG"):
+        lens = [float(np.linalg.norm(np.diff(r[idx], axis=0), axis=1).sum()) for idx in segs]
+        print("clean_ring: %d corners, runs: %s" % (len(corners), ", ".join("%s %.0fmm->%dpt" % (k, L, len(o)) for k, L, o in zip(kinds, lens, out))))
     res = np.vstack(out) if out else pts
     # drop duplicate consecutive points
     keep = np.linalg.norm(res - np.roll(res, 1, axis=0), axis=1) > 1e-6
@@ -413,12 +469,17 @@ def smooth_polygon(poly: Polygon, sigma_mm: float, tol_mm: float, clean_tol_mm: 
     if poly.is_empty or sigma_mm <= 0:
         return poly
     def _one(coords):
-        r = smooth_ring(np.asarray(coords), sigma_mm, 0.0)          # keep dense for straightening
-        r = straighten_ring(r, coarse_tol=max(1.5, sigma_mm), min_len=20.0)   # arcs of r<~30 mm keep their points
+        r = smooth_ring(np.asarray(coords), sigma_mm, 0.0)          # keep dense for the fitting below
         if len(r) >= 3 and clean_tol_mm and clean_tol_mm > 0:
+            # clean_ring fits its own lines (and puts corners at their intersections), so straighten_ring must NOT
+            # run first: it projects a run's interior onto a fitted line but leaves the run's endpoints where they
+            # were, and two straightened runs meeting at a vertex leave a Z-shaped jog of 1-3 mm — the "razor tooth"
+            # on Nolan's screwdriver knob (2026-09-23) was exactly that, at a spot where the raw trace moved 0.56 mm.
             r = clean_ring(r, tol=float(clean_tol_mm))                           # lines / arcs / smooth curves
-        elif len(r) >= 3 and tol_mm > 0:
-            r = cv2.approxPolyDP(r.astype(np.float32).reshape(-1, 1, 2), float(tol_mm), True).reshape(-1, 2).astype(np.float64)
+        else:
+            r = straighten_ring(r, coarse_tol=max(1.5, sigma_mm), min_len=20.0)   # legacy path (TC_CLEAN_TOL < 0)
+            if len(r) >= 3 and tol_mm > 0:
+                r = cv2.approxPolyDP(r.astype(np.float32).reshape(-1, 1, 2), float(tol_mm), True).reshape(-1, 2).astype(np.float64)
         return r
     ext = _one(poly.exterior.coords)
     if len(ext) < 3:
@@ -700,6 +761,71 @@ def subpixel_ring(pts: np.ndarray, signed: np.ndarray, max_shift_px: float = 2.5
         t = t[np.isfinite(t)]
         if len(t):
             out[i] = pts[i] + nrm[i] * t[np.argmin(np.abs(t))]
+    return out
+
+
+def trim_edge_bias(poly_px: np.ndarray, height_mm: np.ndarray, mm_per_px: float, trim_mm: float = 1.9,
+                   h_lo: float = 3.0, h_hi: float = 15.0, probe_mm: float = 6.0) -> np.ndarray:
+    """Pull an outline inward by the sensor's outward edge bias, scaled by the local wall height.
+
+    IR depth blurs a wall outward: the topographic outline of a tall tool sits ~1.9 mm outside the true wall on
+    each side (Nolan's calipers, 2026-09-23: tape measure 89.5 mm at its widest, traced 93.3), while a 2.6 mm steel
+    rule traced 24.7 against 25.0 — no bias to speak of. The bias is a property of the edge ramp (roughly constant
+    width), not of the level rule: raising the cut level fixes the tape but opens sockets' bores as holes and
+    costs IoU. So: per vertex, sample the height a few mm INSIDE the outline, take that as the local wall height h,
+    and move the vertex inward by trim_mm * clip((h - h_lo) / (h_hi - h_lo), 0, 1). Smooth in h, so a clean outline
+    stays clean; never moves a vertex further than a third of the local width, so thin parts cannot cross.
+    """
+    P = np.asarray(poly_px, dtype=np.float64)
+    n = len(P)
+    if n < 3 or height_mm is None or trim_mm <= 0:
+        return P
+    H = np.nan_to_num(height_mm, nan=0.0)
+    area = 0.5 * float(np.sum(P[:, 0] * np.roll(P[:, 1], -1) - np.roll(P[:, 0], -1) * P[:, 1]))
+    sgn = 1.0 if area > 0 else -1.0
+    t = np.roll(P, -1, axis=0) - np.roll(P, 1, axis=0)
+    L = np.linalg.norm(t, axis=1); L[L < 1e-9] = 1.0
+    t /= L[:, None]
+    outward = np.column_stack([t[:, 1], -t[:, 0]]) * sgn          # (t_y, -t_x) is outward for a positive ring
+    inward = -outward
+    probe = np.arange(1.0, probe_mm + 0.01, 1.0) / mm_per_px      # 1..6 mm inside, in px
+    hs = np.zeros(n)
+    widths = np.full(n, np.inf)
+    rows, cols = H.shape
+    for i in range(n):
+        pts = P[i] + inward[i][None, :] * probe[:, None]
+        xs = np.clip(np.rint(pts[:, 0]).astype(int), 0, cols - 1)
+        ys = np.clip(np.rint(pts[:, 1]).astype(int), 0, rows - 1)
+        vals = H[ys, xs]
+        hs[i] = float(np.percentile(vals, 90)) if len(vals) else 0.0
+        # local width: march inward until the height drops back below a third of h (the far wall)
+        far = P[i] + inward[i][None, :] * (np.arange(1.0, 80.0, 1.0) / mm_per_px)[:, None]
+        fx = np.clip(np.rint(far[:, 0]).astype(int), 0, cols - 1); fy = np.clip(np.rint(far[:, 1]).astype(int), 0, rows - 1)
+        fv = H[fy, fx]
+        below = np.nonzero(fv < max(1.0, hs[i] / 3.0))[0]
+        widths[i] = float(below[0]) if len(below) else 80.0
+    # smooth the per-vertex height along the ring so the trim varies gently
+    from scipy.ndimage import gaussian_filter1d
+    hs = gaussian_filter1d(hs, 2.0, mode="wrap")
+    delta = trim_mm * np.clip((hs - h_lo) / max(1e-6, h_hi - h_lo), 0.0, 1.0)
+    delta = np.minimum(delta, widths / 3.0)
+    return P + inward * (delta / mm_per_px)[:, None]
+
+
+def remove_hairs(mask: np.ndarray, mm_per_px: float, hair_mm: float = 1.6) -> np.ndarray:
+    """Remove slivers and notches narrower than `hair_mm` from a footprint mask (morphological open, then close,
+    with a disc of that diameter), keeping only the component(s) that were there before so the tool cannot gain
+    area from a neighbour. The mask is returned unchanged if the cleaning would remove more than 5 % of it — that
+    is no longer a hair, that is the tool."""
+    m = np.asarray(mask, dtype=bool)
+    if not m.any() or hair_mm <= 0:
+        return m
+    d = max(3, int(round(hair_mm / mm_per_px)) | 1)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+    u8 = m.astype(np.uint8)
+    out = cv2.morphologyEx(cv2.morphologyEx(u8, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k).astype(bool)
+    if not out.any() or abs(int(out.sum()) - int(m.sum())) > 0.05 * m.sum():
+        return m
     return out
 
 

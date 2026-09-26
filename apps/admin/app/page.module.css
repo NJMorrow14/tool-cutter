@@ -121,3 +121,26 @@
 .document { max-width:35%; text-align:right; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
 .document strong { display:block; color:var(--text); margin-bottom:3px; }
 @media(max-width:700px) { .shell { padding:16px 12px 28px; gap:16px; } .step { padding:10px; } .stepNum { width:24px; height:24px; } .brand h1 { font-size:22px; } .document { display:none; } .workspaceHeading h2 { font-size:18px; } }
+
+.modelingShell {
+  --bg:#1d2026; --panel:#262a32; --panel-2:#20242b; --text:#e4e8ee; --muted:#9da8b8;
+  --border:#373d48; --border-strong:#4a5260; --accent:#729ef9; --accent-soft:#283c5b;
+  --radius:5px; --shadow:none; color-scheme:dark; color:var(--text);
+  max-width:none; height:calc(100dvh - 48px); padding:0; gap:0; background:var(--bg); overflow:hidden;
+}
+.modelingShell .header { flex:none; padding:8px 16px; border-bottom:1px solid var(--border); background:var(--panel-2); }
+.modelingShell .brand { flex-direction:row; align-items:center; gap:16px; }
+.modelingShell .brand h1 { font-size:13px; letter-spacing:0; }
+.modelingShell .brand span { font-size:11px; border-left:1px solid var(--border); padding-left:16px; }
+.modelingShell .status { background:none; border:0; padding:0; font-size:10px; }
+.modelingShell .stepper { border:0; border-bottom:1px solid var(--border); border-radius:0; background:var(--panel); display:flex; flex:none; }
+.modelingShell .step { padding:9px 24px; border:0; }
+.modelingShell .stepNum, .modelingShell .stepHint { display:none; }
+.modelingShell .stepActive { background:var(--accent-soft); box-shadow:inset 0 -2px var(--accent); }
+.modelingShell .stepTitle { font-size:12px; }
+.modelingShell .workspaceHeading { display:none; }
+.modelingShell[data-workspace='upload'], .modelingShell[data-workspace='calibrate'] { overflow:auto; }
+.modelingShell[data-workspace='upload'] > :last-child, .modelingShell[data-workspace='calibrate'] > :last-child { margin:20px; }
+@media(max-width:850px) { .modelingShell { height:auto; min-height:calc(100dvh - 48px); overflow:visible; } .modelingShell .status { display:none; } .modelingShell .step { padding:10px 14px; } }
+.modelingShell kbd { background:var(--panel-2); color:var(--muted); font-size:9px; border-bottom-width:1px; }
+.modelingShell input, .modelingShell select { min-height:30px; font-size:12px; }

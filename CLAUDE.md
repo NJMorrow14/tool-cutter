@@ -538,12 +538,61 @@ ToolFoam Pro — on-site industrial tool organization (custom-cut foam drawer in
     seeds (seed 5: 0.793 vs 0.854), because rendering the arc first perturbs what the glide scenes come out as.
     Each invocation is internally deterministic (RANSAC is seeded). Only ever compare runs invoked identically —
     several "regressions" chased during this work were that artefact, not the code.
+    **Outlines are drawn ON THE MAT in the 3D view (2026-09-23, Nolan: "still very rocky" after the 2D shape was
+    fixed).** The line used to be draped on the scan surface, i.e. along the FOOT OF A CLIFF, where the 2 mm display
+    grid turns 0.3 mm of lateral wobble into centimetres of vertical zigzag. Measured on the tape: bilinear drape
+    2.2 mm step-to-step, floor-side sampling 1.95 mm with a WORSE worst jump (9.0 vs 5.6) — no sampling scheme
+    follows a cliff on that grid, so the draping approach was dropped, not tuned. A footprint is where the cutter
+    goes; it is drawn planar at z=0.8 with depthTest off (so the far side is not swallowed by the body), handles
+    on the same plane, drag plane matched. The Relief slider does not move it. The remaining sub-mm roughness
+    was then REAL polygon content: +-0.5 mm alternation at ~8 mm wavelength on long flanks, which no hand tool
+    has and the sensor's ~2 mm edge response cannot resolve — `clean_ring` smooths free-curve runs by tier
+    (`TC_CURVE_SMOOTH_MM` 1.5 for 12-30 mm runs, `TC_CURVE_SMOOTH_LONG_MM` 2.5 for >= 30 mm; runs < 12 mm keep the
+    light blur because a fixed 1 mm blur ate 5 mm shaft tips). Verified by LOOKING (screwdriver handle at 0.06
+    mm/px, before/after): sawtooth gone, shaft edge one line. Known-truth IoU 0.768 -> 0.770, arc 0.910 -> 0.906,
+    vertices on the real drawer 361 -> 220, areas within 2 %. Turn-angle "wiggle" metrics went UP while the picture
+    got obviously better — on a sparse polyline they count legitimate vertices; do not steer by them.
+    `TC_CLEAN_DEBUG=1` prints each ring's corners and how every run was classified (line / arc / other).
+    **Edge-bias trim (2026-09-23, fitted to calipers).** `geometry.trim_edge_bias` pulls each outline vertex inward
+    along its normal by `EDGE_TRIM_MM` (1.3, `TC_EDGE_TRIM_MM`; 0 disables) scaled by the LOCAL wall height sampled
+    1-6 mm inside (0 below 3 mm, full above 15 mm, smoothed along the ring, capped at a third of the local width).
+    Rationale: the IR edge ramp is a roughly constant-width blur, so the outward bias is ~constant on tall walls and
+    absent on thin tools — the rule already read 24.7 vs 25.0. Result: tape 92.1 -> **89.5 (caliper 89.5)**; rule
+    untouched. Synthetic complex_tools: IoU 0.770 -> 0.765, Hausdorff 6.9 -> 6.7, signed area +18.3 %% -> +6.4 %% —
+    the renderer's ramp is narrower than the real TrueDepth's, so a real-fitted trim over-trims the synthetic hammer
+    (-10 %%); the calipers win. GATED TO TRUEDEPTH CAPTURES (`scan_meta.sensors`): applied to the rear-LiDAR arc it cost
+    0.906 -> 0.870 and added a smoke failure — a different sensor has a different ramp. NEXT: make the trim self-calibrating — measure the 20-80 %% rise distance along each
+    vertex's normal and trim by a fixed fraction of THAT, which fits both sensors without a constant.
+    **The "razor tooth" (2026-09-23, screwdriver knob) — four causes were found and fixed in one pass, and a fifth
+    turned out not to be one.** (1) `clean_ring` was classifying pairs of spurious corners 3-5 mm apart as tiny
+    "lines" and so PRESERVING a wiggle as geometry: opposite-turning corners closer than `TOOTH_MM` (6) with an
+    excursion under `TOOTH_DEPTH_MM` (3) are now pruned as one tooth before runs are classified. (2) A Gaussian only
+    halves a 3 mm-wide impulse, so free-curve runs now do outlier rejection: samples more than `SPIKE_MM` (1.2; trace
+    noise is 0.3 rms) off the smoothed curve are replaced and the run re-smoothed. (3) `straighten_ring` must NOT run
+    before `clean_ring`: it projects a run's INTERIOR onto a fitted line but leaves the run's endpoints, so two
+    straightened runs meeting at a vertex leave a 1-3 mm Z-jog — clean_ring fits its own lines, so the old pass is
+    now legacy-only (TC_CLEAN_TOL < 0). (4) `geometry.remove_hairs` (open+close with a `HAIR_MM` = 1.6 mm disc,
+    refused if it would change > 5 % of the mask) runs on the mask in `_topo_tool_result` before tracing: a
+    1-2 px-wide hair several mm long is THIN IN WIDTH BUT LONG ALONG THE CONTOUR (out and back), so no along-the-curve
+    filter can remove it — only mask morphology can. (5) NOT a tooth: the -121 deg vertex at the shaft's TIP. A
+    tapered screwdriver tip is supposed to turn sharply; a "sharpest vertex" search kept steering to it. Judge teeth
+    by LOOKING at the region the user pointed at, not by the global max turn. Verified on the knob render: both
+    flanks single strokes; known-truth IoU 0.770 unchanged, arc 0.906 unchanged, tests OK.
+    **Marker mask must not erase tools (2026-09-23, Nolan: "why is the head of the hammer shaped so weird").** The
+    hammer's striking face had a clean RECTANGULAR notch cut from its corner — axis-aligned, so not noise. Cause:
+    `_marker_mask` excludes 1.5x each marker (the paper's quiet border) from detection, and the hammer head sat
+    inside the top-left marker's zone: 4.8 cm2 of a 28 mm-tall head zeroed. Paper reads ~0 mm (folded, 2-4 mm), so
+    the mask now keeps only pixels under `MARKER_MASK_MAX_MM` (5.0, `TC_MARKER_MASK_MAX_MM`). Hammer 129.4 ->
+    133.1 cm2 with its corner back; synthetic 9/9 at IoU 0.768 unchanged. Side effect: whatever tall thing the mask
+    used to hide near a marker now shows — on b59fc5fdd2d1 a 13.6 x 69 mm, 24 mm-tall sliver hugging the top edge
+    appeared (almost certainly the drawer wall). WHEN AN OUTLINE HAS A STRAIGHT, AXIS-ALIGNED DEFECT, LOOK FOR A
+    MASK OR CROP RECTANGLE, NOT A SENSOR EXPLANATION.
     **GROUND TRUTH, FINALLY (2026-09-23, Nolan's calipers).** Steel rule **25.0 mm** wide. Black tape measure:
     **87.5 mm across its base, 89.5 mm at its widest** (a pocket must pass the widest part, so 89.5 is the target).
     Measured against them, on capture `b59fc5fdd2d1` (78 frames, ALL placed by two markers + the typed 297 x 417
     drawer — registration exact, so this isolates the sensor + extraction):
       * tape outline **93.3 mm -> +3.8 mm** over the true widest; **raising height_threshold_mm 2 -> 12 moves it only
-        to 92.5**. The cut level is NOT the lever. The excess is ~1.9 mm per side, which is the sensor's measured
+        to 92.5** — `height_threshold_mm` is the blob SEED, not the level; `TC_TOPO_FRAC` (the level) DOES move it (0.5 -> 92.1, 0.8 -> 90.2, 0.9 -> 87.9) but opens sockets' bores as holes and costs IoU. So the level is not the RIGHT lever; The excess is ~1.9 mm per side, which is the sensor's measured
         20-80 %% edge rise (1.9-2.6 mm on this scan) — IR depth blurs the wall outward, and topo_footprint's "50 %% of
         the nearest FLAT pixel" lands on the ramp's shoulder. In the height map the tape reads 89.5 mm at 20 mm up,
         90.4 at 12, 91.5 at 5, 94.5 at 0.5: the sensor SEES the true girth at mid-height; only the low levels are fat.
