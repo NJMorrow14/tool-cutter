@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import math
 
@@ -44,7 +44,7 @@ import numpy as np
 from flask import Flask, Response, jsonify, request, send_file
 from flask_cors import CORS
 
-from toolcutter import calibration, capture as capmod, geometry, photogrammetry as pgm, scan as scanmod
+from toolcutter import calibration, capture as capmod, cleanup as cleanupmod, geometry, photogrammetry as pgm, recognize, relief as reliefmod, scan as scanmod
 from toolcutter.registration import floor_alignment, warp_translation
 from toolcutter.tool_views import choose_tool_frame, coverage_report, discovery_windows
 from toolcutter.exporters import layout_to_dxf, layout_to_stl, layout_to_svg, layout_tools_to_stl
@@ -133,6 +133,7 @@ def _save_capture(sid: str, frames_meta: List[Dict], form: Dict, blobs: Dict[str
         session = STORE.get(sid)
         if session is not None:
             save_session(d, session)
+            _prune_processed()
     except Exception:  # noqa: BLE001
         log.exception("could not save capture %s", sid)
 
@@ -164,6 +165,7 @@ def _rebuild_capture(sid: str):
         except Exception:  # noqa: BLE001
             log.exception("could not refresh capture manifest %s", sid)
     save_session(d, s)
+    _prune_processed()
     return s
 
 
@@ -248,11 +250,25 @@ def _topo_tool_result(s, tool_id: str, mask: np.ndarray, points: List[Dict], box
                       signed: Optional[np.ndarray] = None) -> Dict:
     """Tool from a topographic footprint mask (no photo involved). `signed` is topo_footprint's
     height-minus-keep-level field, which puts the outline on the sub-pixel edge instead of on pixel corners."""
+    # Hairline spikes and notches (1-2 px wide, several mm long) are below anything the sensor can resolve, and
+    # contour-domain smoothing cannot remove them: a spike is thin in WIDTH but long along the CONTOUR (out and back),
+    # so along-the-curve filters treat it as a feature. Nolan's screwdriver knob (2026-09-23) carried a 4.7 mm hair
+    # that survived three rounds of polygon cleaning and showed as a "razor tooth". Mask morphology sees it for what
+    # it is: open removes slivers narrower than HAIR_MM, close fills notches narrower than that. Both are well under
+    # the 6 mm shaft of the thinnest tool and the 2 mm inner-corner limit noted for reconnection closings.
+    mask = geometry.remove_hairs(mask, s.mm_per_px, HAIR_MM)
     stats = scanmod.measure_thickness(s.rect_height, mask) if (s.rect_height is not None and mask.any()) else None
     # the edge wobbles at roughly the depth-sensor cell size, so smooth at that scale, not the raster's;
     # straighten_ring then snaps the straight runs back, so corners come from intersecting runs, not rounding
     poly = geometry.topo_polygon(mask, s.mm_per_px, signed=signed,
                                  sigma_mm=max(1.0, TOPO_SMOOTH_CELLS * _depth_cell_mm(s)))
+    # Calibrated on the FRONT TrueDepth camera only (tape 92.1 -> 89.5). The rear LiDAR's edge ramp is different:
+    # applying the same trim there cost the arc harness 0.906 -> 0.870 IoU and added a smoke failure, so the trim
+    # is gated to TrueDepth captures until it is made self-calibrating from the measured ramp.
+    sensors = (s.scan_meta or {}).get("sensors") or []
+    if poly is not None and s.rect_height is not None and EDGE_TRIM_MM > 0 \
+            and any(str(x).startswith("truedepth") for x in sensors):
+        poly = geometry.trim_edge_bias(poly, s.rect_height, s.mm_per_px, trim_mm=EDGE_TRIM_MM)
     area_px = float(cv2.contourArea(poly.astype(np.float32))) if poly is not None else float(mask.sum())
     res: Dict[str, Any] = {
         "id": tool_id, "session_id": s.id, "points": points, "box": box,
@@ -282,6 +298,8 @@ def _edge_source(s, body: Dict) -> str:
     return "topo" if s.rect_height is not None else "photo"
 
 
+SUPPORT_TOL_MM = float(os.environ.get("TC_SUPPORT_TOL_MM", "3.0"))   # a frame "agrees" with the fused height within this
+MIN_SUPPORT = int(os.environ.get("TC_MIN_SUPPORT", "2"))             # tall cells/blobs need this many agreeing frames
 RANK_PENALTY_MM = 0.0     # preferring exactly placed frames for SAM/mosaic was tried (150 mm): fixed one tool, lost two
 
 
@@ -916,6 +934,17 @@ REFIT_LOW_MM = float(os.environ.get("TC_REFIT_LOW_MM", "8.0"))   # re-fit blobs 
 # A detected tool must be at least this tall at its 90th percentile. Bare mat reads 0.08 mm (p90) on a clean
 # scan and up to 3.4 mm (p99) over an ArUco marker; a real 3 mm steel rule reads 2.5 mm. TC_TOOL_MIN_H overrides.
 TOOL_MIN_HEIGHT_MM = float(os.environ.get("TC_TOOL_MIN_H", "1.5"))
+# Mask features thinner than this are hairs (sub-resolution slivers/notches), removed before an outline is traced.
+HAIR_MM = float(os.environ.get("TC_HAIR_MM", "1.6"))
+# A pose-placed frame whose predicted drawer corners sit further than this off its own floor plane is drifted
+# past use. 25 mm let the shredding on 3130f123ed91 through; the gap between marker sightings is now what bounds
+# the nearest-anchor rule above is what actually bounds drift.
+POSE_FLOOR_TOL_MM = float(os.environ.get("TC_POSE_FLOOR_TOL_MM", "25.0"))
+# Outward edge bias of the depth sensor on a tall wall, trimmed back per vertex (0 below 3 mm, full above 15 mm).
+# Fitted to calipers: tape measure traced 92.1 (after hair removal) vs 89.5 true = 1.3 mm per side. TC_EDGE_TRIM_MM=0 disables.
+EDGE_TRIM_MM = float(os.environ.get("TC_EDGE_TRIM_MM", "1.3"))
+# The marker exclusion zone may erase pixels only up to this height: paper, even folded, is not this tall.
+MARKER_MASK_MAX_MM = float(os.environ.get("TC_MARKER_MASK_MAX_MM", "5.0"))
 TOPO_SMOOTH_CELLS = float(os.environ.get("TC_TOPO_SMOOTH", "1.0"))   # outline smoothing, in depth cells
 MIN_SHIFT_GAIN = float(os.environ.get("TC_MIN_GAIN", "1.0"))    # never apply a shift that fits WORSE than standing still
 APPLY_SHIFT_MAX_MM = float(os.environ.get("TC_APPLY_MAX_MM", "8.0"))   # ...nor one too big to be drift (see below)
@@ -1046,7 +1075,12 @@ def _parse_frame_upload(f: Dict, blobs: Dict[str, bytes], form_intr: Optional[Di
         raw = blobs.get(f["depth"])
         if raw is None:
             raise ApiError(f"Frame depth {f['depth']} not uploaded")
-        depth = np.frombuffer(raw, dtype="<f4").reshape(int(f["depth_height"]), int(f["depth_width"])).copy()
+        if str(f.get("depth_dtype") or "f32") == "u2mm":
+            # uint16 millimetres (0 = no return): half the bytes of float32 and compresses far better; 0.1 % of the
+            # value at 300 mm is 0.3 mm, well under the sensor's ~2 mm edge response
+            depth = (np.frombuffer(raw, dtype="<u2").reshape(int(f["depth_height"]), int(f["depth_width"])).astype(np.float32) / 1000.0)
+        else:
+            depth = np.frombuffer(raw, dtype="<f4").reshape(int(f["depth_height"]), int(f["depth_width"])).copy()
         if K is None:
             raise ApiError("Depth frames need intrinsics")
         depth[~np.isfinite(depth) | (depth <= 0)] = np.nan
@@ -1103,6 +1137,142 @@ def _pose_cv(f: Dict) -> Optional[np.ndarray]:
     out[:3, :3] = R_cv
     out[:3, 3] = tr * (1000.0 if f.get("transform_units", "m") == "m" else 1.0)
     return out
+
+
+def _pose_raw(f: Dict) -> Optional[np.ndarray]:
+    """The ARKit camera-to-world 4x4 as stored, for EVERY sensor (unlike _pose_cv, which refuses the mirrored front
+    camera). Used only for RELATIVE motion between frames, where the handedness is fitted from the data."""
+    t = f.get("transform")
+    if t is None:
+        return None
+    arr = np.asarray(t, dtype=np.float64)
+    M = arr.reshape(4, 4).T if arr.ndim == 1 else arr.reshape(4, 4)
+    if abs(M[3, 3] - 1.0) > 1e-6 and abs(M[3, 3]) < 1e-9:
+        M = arr.reshape(4, 4)
+    if f.get("transform_units", "m") == "m":
+        M = M.copy(); M[:3, 3] *= 1000.0
+    return M
+
+
+def _chain_by_relative_pose(results, result_idx, frames_meta, kept, corners_list, rect_w_mm: float, rect_h_mm: float,
+                            max_gap: int = 6) -> int:
+    """Place still-unplaced depth frames from the RELATIVE ARKit motion between adjacent frames.
+
+    The front camera's absolute pose is unusable (mirrored image, drifting world frame), but the step from one frame
+    to the next 0.3 s later is good: on a237eba87dba the camera-foot displacement from the poses matched the
+    registered placements to a 2.7 mm median over 19 pairs — once x is MIRRORED (the image was un-mirrored, the
+    pose was not) and the world yaw is fitted. Both are fitted here from the frames already placed, per capture, so
+    nothing about the convention is assumed: if the fit is poor (median > 8 mm) nothing is chained. Each unplaced
+    frame is then placed from its nearest placed neighbour in time (<= max_gap frames), chains extending outward,
+    and gets rank 2 so the height-map refinement may still correct it. Returns how many frames were placed."""
+    import cv2 as _cv
+    rect = np.array([[0, 0], [rect_w_mm, 0], [rect_w_mm, rect_h_mm], [0, rect_h_mm]], np.float32)
+    pos = {id(r): k for k, r in enumerate(results)}
+    frame_of = {k: result_idx[k] for k in range(len(results))}
+    poses = {}
+    for k in range(len(results)):
+        M = _pose_raw(frames_meta[frame_of[k]]) if frame_of[k] < len(frames_meta) else None
+        if M is not None and results[k].geometry is not None:
+            poses[k] = M
+
+    def foot_head(res, cpx):
+        A, _ = _cv.estimateAffine2D(np.asarray(cpx, np.float32), rect)          # raster px -> drawer mm
+        if A is None:
+            return None
+        g = res.geometry
+        u = float(-(g.c @ g.e_u)); v = float(-(g.c @ g.e_v))
+        nadir = g.plane_to_raster(np.array([[u, v]]))[0]
+        foot = A @ np.array([nadir[0], nadir[1], 1.0])
+        head = math.atan2(A[1, 0], A[0, 0]); scale = math.hypot(A[0, 0], A[1, 0])
+        return foot, head, nadir, scale
+
+    def yaw_of(M):
+        right = M[:3, 0]
+        return math.atan2(right[2], right[0])
+
+    placed = {}
+    solid = set()      # frames placed by depth registration or 2+ markers: the ones the fit may trust
+    for res, c in zip(kept, corners_list):
+        k = pos.get(id(res))
+        if k is None or k not in poses:
+            continue
+        fh = foot_head(res, c)
+        if fh is not None:
+            placed[k] = fh
+            # NOT `drawer_corners is not None`: the neighbour-matching fallback writes drawer_corners too, and those
+            # photo-matched placements are exactly the shaky ones (11-15 mm median with them, 2.7 without)
+            if res.meta.get("placed_by_rgbd") or len(res.markers_px) >= 2:
+                solid.add(k)
+    unplaced = [k for k in range(len(results)) if k in poses and id(results[k]) not in {id(r) for r in kept}]
+    if len(placed) < 4 or not unplaced:
+        return 0
+    # fit mirror + yaw from consecutive placed pairs
+    # the fit uses only SOLID pairs (both frames registered by depth or by 2+ markers): frames placed by one marker or
+    # by photo matching on a dark liner are the shaky ones, and including them took the fit from 2.7 to 14.9 mm median
+    ks = sorted(solid) if len(solid) >= 4 else sorted(placed)
+    dreg, dpose = [], []
+    for a, b in zip(ks, ks[1:]):
+        if b - a > 3:
+            continue
+        dw = poses[b][:3, 3] - poses[a][:3, 3]
+        dreg.append(placed[b][0] - placed[a][0]); dpose.append([dw[0], dw[2]])
+    if len(dreg) < 3:
+        return 0
+    dreg = np.array(dreg); dpose = np.array(dpose)
+
+    def fit(mask):
+        best = None
+        for mirror in (1.0, -1.0):
+            P = dpose[mask] * np.array([mirror, 1.0])
+            u_, _, vt = np.linalg.svd(P.T @ dreg[mask]); R = vt.T @ u_.T
+            if np.linalg.det(R) < 0:
+                vt[-1] *= -1; R = vt.T @ u_.T
+            resid_all = np.linalg.norm((dpose * np.array([mirror, 1.0])) @ R.T - dreg, axis=1)
+            med = float(np.median(resid_all[mask]))
+            if best is None or med < best[0]:
+                best = (med, mirror, R, resid_all)
+        return best
+    mask = np.ones(len(dreg), bool)
+    med, mirror, R, resid_all = fit(mask)
+    keep = resid_all <= max(10.0, 3 * med)          # one robust re-fit without the outlier pairs (drift stretches)
+    if keep.sum() >= 3 and keep.sum() < len(keep):
+        med, mirror, R, resid_all = fit(keep)
+    p90 = float(np.percentile(resid_all[keep], 90)) if keep.sum() else float("inf")
+    if med > 8.0:
+        log.info("multi-still: relative poses do not fit the placed frames (median %.1f mm over %d pairs, %d solid frames) — not chaining by pose",
+                 med, len(dreg), len(solid))
+        return 0
+    yaw_sign = -1.0 if mirror < 0 else 1.0
+    log.info("multi-still: relative-pose fit over %d pairs: median %.1f mm, p90 %.1f mm, x %s — chaining %d unplaced frames",
+             len(dreg), med, p90, "mirrored" if mirror < 0 else "as is", len(unplaced))
+    n_added = 0
+    pending = set(unplaced)
+    while pending:
+        progress = False
+        for k in sorted(pending):
+            near = [j for j in placed if abs(j - k) <= max_gap]
+            if not near:
+                continue
+            j = min(near, key=lambda jj: abs(jj - k))
+            foot_j, head_j, _, _ = placed[j]
+            dw = poses[k][:3, 3] - poses[j][:3, 3]
+            d = R @ (np.array([dw[0], dw[2]]) * np.array([mirror, 1.0]))
+            foot_k = foot_j + d
+            head_k = head_j + yaw_sign * (yaw_of(poses[k]) - yaw_of(poses[j]))
+            res = results[k]; g = res.geometry
+            u = float(-(g.c @ g.e_u)); v = float(-(g.c @ g.e_v))
+            nadir = g.plane_to_raster(np.array([[u, v]]))[0]
+            cs, sn = math.cos(head_k), math.sin(head_k)
+            # drawer mm = Rot(head) * (px - nadir) * mpp + foot  ->  px = nadir + Rot(-head) * (mm - foot) / mpp
+            mm = rect.astype(np.float64) - foot_k
+            px = np.column_stack([cs * mm[:, 0] + sn * mm[:, 1], -sn * mm[:, 0] + cs * mm[:, 1]]) / res.mm_per_px + nadir
+            corners_list.append(px); kept.append(res)
+            res.meta["placed_by_pose"] = True
+            placed[k] = (foot_k, head_k, nadir, 1.0 / res.mm_per_px)
+            pending.discard(k); n_added += 1; progress = True
+        if not progress:
+            break
+    return n_added
 
 
 CORNER_NAMES = ["top-left", "top-right", "bottom-right", "bottom-left"]
@@ -1165,6 +1335,31 @@ def _corner_map_for_frames(frames_meta: List[Dict], blobs: Dict[str, bytes], mar
     return None
 
 
+@app.post("/api/markers")
+def preflight_markers():
+    """Marker preflight for the phone: one JPEG in, which corner markers it shows out — BEFORE a sweep starts.
+
+    Every real scan that failed on 2026-10-01 failed for want of an overview frame: a7af39bd92eb began at 31 cm
+    seeing one marker, never caught an adjacent pair, and its drawer size had to be triangulated from drifting
+    poses (280 mm for a 297 mm drawer -> every one-marker frame stretched 6 %%, tools shredded). The app's text said
+    "start high" and nothing enforced it. Now the Start button waits for this to report >= 3 markers.
+    Form fields: image (JPEG). Returns {ids, count, adjacent_pair, ok} — ok = 3+ markers, i.e. the drawer can be
+    measured exactly from this view.
+    """
+    up = request.files.get("image")
+    if up is None:
+        raise ApiError('Send the frame as form field "image"')
+    img = decode_image(up.read())
+    # a phone preview frame can be sent small; ArUco needs the marker ~20 px across, and a 50 mm marker in a
+    # 300 mm drawer at 60 cm fills ~1/8 of the frame width, so even 640 px wide is plenty
+    mk = capmod.corner_markers(capmod.detect_markers(img, request.form.get("marker_dict") or "DICT_4X4_50"))
+    ids = sorted(int(i) for i in mk)
+    log.info("preflight: %dx%d frame -> markers %s", img.shape[1], img.shape[0], ids)   # so a phone that "can't see markers" is diagnosable here
+    pairs = {(0, 1), (1, 2), (2, 3), (0, 3)}      # adjacent in printed order; any 3 ids contain one
+    adjacent = any({a, b} <= set(ids) for a, b in pairs)
+    return jsonify({"ids": ids, "count": len(ids), "adjacent_pair": adjacent, "ok": len(ids) >= 3})
+
+
 @app.post("/api/captures/multi")
 def create_multi_capture():
     """Several stills of the same drawer from different positions (manifest like /api/sweeps, depth optional).
@@ -1208,33 +1403,78 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     def is_truedepth(f):
         return str(f.get("sensor") or "").startswith("truedepth")
 
-    for i, f in enumerate(frames_meta):
-        img, depth, K = _parse_frame_upload(f, blobs)
-        markers = capmod.corner_markers(capmod.detect_markers(img, marker_dict))
-        pose = _pose_cv(f)
+    # Per-frame work is independent, so it runs on a thread pool: cv2 and numpy release the GIL, and this stage was
+    # 69 s of a 262 s build for 119 frames on a 10-core machine (2026-10-02, "sending the frames and building the
+    # drawer on the mac take a while"). Order is preserved and a failure becomes a skip exactly as before.
+    def _one(i, f):
         try:
+            img, depth, K = _parse_frame_upload(f, blobs)
+            markers = capmod.corner_markers(capmod.detect_markers(img, marker_dict))
+            pose = _pose_cv(f)
             if depth is not None:
                 res = capmod.rectify_rgbd(img, depth, K, markers, marker_size, corner_map=corner_map,
                                           preserve_unknown=is_truedepth(f))
             else:
                 if not markers:
-                    skipped.append((i, "no markers")); continue
+                    return i, None, "no markers", None, None
                 res = capmod.rectify_markers_only(img, markers, marker_size, corner_map=corner_map)
+            feats = None
+            if is_truedepth(f) and depth is not None and res.geometry is not None:
+                from toolcutter.rgbd_registration import depth_features
+                feats = depth_features(img, depth, K, res.geometry, height_mm=res.height_mm)
+            res.meta["use"] = str(f.get("use") or "both").lower()
+            res.meta["has_depth"] = depth is not None
+            return i, res, None, pose, feats
         except Exception as exc:  # noqa: BLE001
-            skipped.append((i, str(exc))); continue
-        # A frame may be here for its DEPTH, its COLOUR, or both. Two-pass capture (Nolan, 2026-09-21): sweep
-        # the drawer with the front TrueDepth camera for topography, then shoot sharp stills with the rear
-        # camera, triggered by hand so nothing is taken mid-move. Both passes still register off the markers,
-        # so they land on the same grid without needing a pose chain between them.
-        res.meta["use"] = str(f.get("use") or "both").lower()
-        res.meta["has_depth"] = depth is not None
+            return i, None, str(exc), None, None
+
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, min(int(os.environ.get("TC_FRAME_WORKERS", "8")), len(frames_meta)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        outcomes = list(ex.map(lambda a: _one(*a), enumerate(frames_meta)))
+    result_idx = []
+    for i, res, why, pose, feats in outcomes:
+        if res is None:
+            skipped.append((i, why)); continue
         results.append(res)
+        result_idx.append(i)
         poses.append(pose)
-        if is_truedepth(f) and depth is not None and res.geometry is not None:
-            from toolcutter.rgbd_registration import depth_features
-            depth_matches.append(depth_features(img, depth, K, res.geometry))
-        else:
-            depth_matches.append(None)
+        depth_matches.append(feats)
+    # MARKER SIZE SANITY (2026-10-03, capture a237eba87dba: the phone said 50 mm, the markers on the drawer were the new
+    # 25 mm ones). A depth frame measures a marker METRICALLY, independent of any setting, so when the measured size
+    # disagrees with the declared one by more than 15 % the declared value is wrong, not the depth — and everything
+    # that was built on it (the overview photo's scale, hence the drawer rectangle, 598 x 800 for a ~300 x 400 drawer)
+    # has to be rebuilt. Only photo-only frames depend on the size (rectify_markers_only); depth frames use it for
+    # a scale check only. Snap to the printed sizes (25 / 50) when close, since depth reads a couple of %% long.
+    declared_marker = marker_size
+    meas0 = []
+    for res in results:
+        if not res.meta.get("has_depth") or not res.markers_px:
+            continue
+        for c in res.markers_px.values():
+            c = np.asarray(c, dtype=np.float64).reshape(-1, 2)
+            if len(c) == 4:
+                meas0.append(float(np.mean([np.linalg.norm(c[j] - c[(j + 1) % 4]) for j in range(4)])) * res.mm_per_px)
+    if len(meas0) >= 3:
+        measured = float(np.median(meas0))
+        if abs(measured / marker_size - 1.0) > 0.15:
+            snapped = 25.0 if abs(measured - 25.0) <= 3.0 else 50.0 if abs(measured - 50.0) <= 6.0 else round(measured * 2) / 2
+            log.warning("multi-still: the upload declared %.1f mm markers but %d depth sightings measure %.1f mm — using %.1f mm "
+                        "(check the marker size setting in the app)", marker_size, len(meas0), measured, snapped)
+            marker_size = snapped
+            for k, res in enumerate(results):
+                if res.meta.get("has_depth"):
+                    continue
+                f = frames_meta[result_idx[k]]
+                try:
+                    img, _depth, _K = _parse_frame_upload(f, blobs)
+                    markers = capmod.corner_markers(capmod.detect_markers(img, marker_dict))
+                    if markers:
+                        new = capmod.rectify_markers_only(img, markers, marker_size, corner_map=corner_map)
+                        new.meta["use"] = res.meta.get("use", "both"); new.meta["has_depth"] = False
+                        results[k] = new
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("multi-still: could not re-rectify photo frame %d at %.1f mm: %s", result_idx[k], marker_size, exc)
     # DEPTH SCALE CALIBRATION AGAINST THE MARKERS (2026-09-23, from Nolan's calipers). A depth frame gets its
     # metric scale from the depth itself, and the front TrueDepth depth is not quite metric: on capture
     # b59fc5fdd2d1 the 50 mm markers measured 52.11 mm in the depth-derived rasters (+4.2 %), and the black tape
@@ -1243,7 +1483,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     # which are depth units too) by the one robust factor. Photogrammetry already does the same from marker
     # spacing (_session_from_mesh_file). TC_DEPTH_CAL=0 disables; the factor is reported as scan_meta.depth_scale.
     depth_scale = 1.0
-    if os.environ.get("TC_DEPTH_CAL", "0") == "1":   # OFF by default: marker-placed frames are already metric in-plane; see CLAUDE.md
+    if os.environ.get("TC_DEPTH_CAL", "0") == "1":   # OFF: on marker-placed scan fed17f4780dc it shrank a size that matched the typed drawer by 1.2 % and doubled floor noise
         meas = []
         for res in results:
             if not res.meta.get("has_depth") or not res.markers_px:
@@ -1273,10 +1513,17 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     # TrueDepth supplies synchronized metric depth, but no ARKit world pose.
     # Place overlapping floor rasters jointly before completing drawer corners.
     depth_indices = {i for i, features in enumerate(depth_matches) if features is not None}
+    # (A gate that skipped this when markers already placed 80 %% of depth frames was tried on 2026-10-02 and
+    # removed: on real front-camera sweeps 0 of 118 frames see two markers, so it never fired, and on synthetic
+    # frames — which see all four — it skipped registration and broke test_rear_photo_does_not_disable_depth_registration.)
+    two_plus = sum(1 for i in depth_indices if len(results[i].markers_px) >= 2)
+    log.info("multi-still: %d depth frames, %d with 2+ markers, %d with any marker",
+             len(depth_indices), two_plus, sum(1 for i in depth_indices if results[i].markers_px))
     if len(depth_indices) > 1:
         from toolcutter.rgbd_registration import register_depth_subset
+        overview = next((i for i, r in enumerate(results) if r is not None and r.drawer_corners is not None), None)
         visual_corners, inferred_map, measured_size, registration_info = register_depth_subset(
-            results, depth_matches, infer_order=corner_map is None)
+            results, depth_matches, infer_order=corner_map is None, reference_index=overview)
         if visual_corners:
             if inferred_map:
                 corner_map = inferred_map
@@ -1445,8 +1692,15 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
         if form.get("drawer_width_mm"): ws = [float(form["drawer_width_mm"])]
         if form.get("drawer_height_mm"): hs = [float(form["drawer_height_mm"])]
         if not ws or not hs:
-            raise ApiError("Could not measure the drawer: no frame shows 3 markers, and the visible pairs do not cover both "
-                           "a width edge and a depth edge. Add a frame that sees the top or bottom pair, or type the drawer size. "
+            # Say WHICH failure this is. Since the phone app dropped its drawer-size fields (2026-09-29) the markers are
+            # the only source of scale, and "no markers at all" (sheet not in the drawer, or a test sweep of a desk)
+            # needs different advice from "markers seen, but never a pair on both axes".
+            seen = sum(len(r.markers_found) for r in results)
+            if seen == 0:
+                raise ApiError("No corner markers were seen in any frame. Put the printed marker sheet's four squares in the "
+                               "drawer's corners, then start the sweep high enough that all four are in view before gliding along.")
+            raise ApiError("Could not measure the drawer: no frame shows 3 markers, and the frames that show 2 never cover both a "
+                           "width edge and a depth edge. Start the sweep higher, with all four corner markers in view, then glide. "
                            + "; ".join(f"frame {i}: {why}" for i, why in skipped))
         form = dict(form)
         form["drawer_width_mm"] = str(np.median(ws))
@@ -1474,12 +1728,22 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     pose_anchor = any(p is not None and r.geometry is not None and (r.drawer_corners is not None or r.markers_px)
                       for r, p in zip(results, poses))
     chained = 0
-    if not visual_corners and any(r.drawer_corners is None and not r.markers_px and (p is None or not pose_anchor)
+    # frames the depth registration placed count as placed for the neighbour-matching fallback below (it looks at
+    # drawer_corners), and frames it could NOT place are no longer skipped: they fall back to their own markers or to
+    # neighbour matching exactly as if the registration had not run (2026-10-03: a one-frame "registered" cluster
+    # used to disqualify the other 64 frames of a sweep)
+    for i, c in visual_corners.items():
+        if results[i].drawer_corners is None:
+            results[i].drawer_corners = np.asarray(c, dtype=np.float64)
+            results[i].meta["placed_by_rgbd"] = True
+    if any(r.drawer_corners is None and not r.markers_px and (p is None or not pose_anchor)
            for r, p in zip(results, poses)):
         if not pose_anchor and any(p is not None for p in poses):
             log.info("multi-still: poses present but nothing anchors them (no frame has markers + depth); "
                      "placing marker-less frames by matching instead")
         chained = _chain_unanchored(results, width_mm, height_mm, inset)
+
+    results_by_index = {i: r for i, r in enumerate(results)}
 
     def _register(width_mm: float, height_mm: float):
         """Pass 2: place every frame on the common drawer grid. Frames with two adjacent markers (one end of a
@@ -1493,9 +1757,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
         pending = []
         for i, (res, pose) in enumerate(zip(results, poses)):
             c = None
-            if visual_corners and i in depth_indices:
-                if i not in visual_corners:
-                    skipped.append((i, "no reliable depth-corrected overlap with the drawer")); continue
+            if visual_corners and i in visual_corners:
                 c = _inset(visual_corners[i], res.mm_per_px)
             elif res.drawer_corners is not None:
                 c = _inset(calibration.order_corners(res.drawer_corners), res.mm_per_px)
@@ -1526,20 +1788,45 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
                 for i, *_ in pending:
                     skipped.append((i, "no camera pose on any marker-registered frame to anchor to"))
             else:
-                a_res, a_c, a_pose = anchor
-                # drawer corners as 3D points: anchor raster px -> plane mm -> anchor camera -> world
-                a_uv = a_res.geometry.raster_to_plane(np.asarray(a_c, dtype=np.float64))
-                a_cam = a_res.geometry.plane_to_cam(a_uv, 0.0)
-                world = (a_pose[:3, :3] @ a_cam.T).T + a_pose[:3, 3]
+                # EVERY marker-placed frame with a pose is an anchor, and each pose-only frame uses the one NEAREST
+                # IN TIME. ARKit drifts: on Nolan's 18 cm sweep (3130f123ed91, 2026-10-01) markers 2 and 3
+                # re-projected within 1 mm across frames while markers 0 and 1 scattered 11 and 32 mm — the
+                # tracking slid during one stretch over featureless liner. With ONE global anchor every pose
+                # frame inherited the drift of its whole stretch and the hammer head landed 45 mm apart between
+                # frames (tools came out shredded). A marker sighting every few frames re-zeroes the chain, so the
+                # error is bounded to the gap between sightings. Two-marker anchors are preferred over one-marker.
+                pos = {id(r): k for k, r in enumerate(results)}
+                anchors = []
+                for res, c in zip(kept, corners_list):
+                    pose = poses[pos[id(res)]]
+                    if pose is not None and res.geometry is not None and len(res.markers_px) >= 1:
+                        a_uv = res.geometry.raster_to_plane(np.asarray(c, dtype=np.float64))
+                        a_cam = res.geometry.plane_to_cam(a_uv, 0.0)
+                        anchors.append((pos[id(res)], len(res.markers_px), (pose[:3, :3] @ a_cam.T).T + pose[:3, 3]))
+                if not anchors:
+                    a_res, a_c, a_pose = anchor
+                    a_uv = a_res.geometry.raster_to_plane(np.asarray(a_c, dtype=np.float64))
+                    anchors = [(pos[id(a_res)], 2, (a_pose[:3, :3] @ a_res.geometry.plane_to_cam(a_uv, 0.0).T).T + a_pose[:3, 3])]
                 for i, res, pose in pending:
+                    # nearest in time; among equals, the one with more markers
+                    _, _, world = min(anchors, key=lambda a: (abs(a[0] - i), -a[1]))
                     inv = np.linalg.inv(pose)
                     cam = (inv[:3, :3] @ world.T).T + inv[:3, 3]
                     # project onto this frame's floor plane (drop residual height from pose drift) and into its raster
                     uv, h_res = res.geometry.cam_to_plane(cam)
-                    if np.abs(h_res).max() > 25.0:
+                    if np.abs(h_res).max() > POSE_FLOOR_TOL_MM:
                         skipped.append((i, f"pose inconsistent with the floor plane ({np.abs(h_res).max():.0f} mm)")); continue
                     corners_list.append(res.geometry.plane_to_raster(uv))
                     kept.append(res)
+        # frames that nothing above could place but which carry an ARKit pose: chain them from a placed neighbour by
+        # the RELATIVE pose step (handedness and yaw fitted from the placed frames; see _chain_by_relative_pose)
+        chained_pose = _chain_by_relative_pose(results, result_idx, frames_meta, kept, corners_list,
+                                               width_mm - 2 * inset, height_mm - 2 * inset)
+        if chained_pose:
+            log.info("multi-still: %d frame(s) placed by relative camera pose from a placed neighbour", chained_pose)
+            for i, why in list(skipped):
+                if results_by_index.get(i) is not None and results_by_index[i].meta.get("placed_by_pose"):
+                    skipped.remove((i, why))
         if not kept:
             raise ApiError("No usable frames: " + "; ".join(f"frame {i}: {why}" for i, why in skipped))
         # keep temporal order (pending frames were appended after the marker frames)
@@ -1645,7 +1932,16 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
             if hs and abs(mean_shift[1]) > 3.0:
                 est_h = float(np.mean(hs)) / ppm + 2 * inset + float(mean_shift[1]) * (1 if any(2 in res.markers_px or 3 in res.markers_px for res, oe in zip(kept, other_end) if oe) else -1)
         for res, f in zip(kept, frames):
-            f["rank"] = 0 if (visual_corners or res.drawer_corners is not None or len(res.markers_px) >= 2) else (1 if res.markers_px else 2)
+            # how firmly the frame is placed: 0 = depth-registered / drawer corners / 2+ markers, 1 = one marker,
+            # 2 = chained by relative pose or matched to a neighbour (refinement may still move these). (The old test
+            # `if (visual_corners or ...)` made EVERY frame rank 0 once any depth registration had applied.)
+            f["placed_by_pose"] = bool(res.meta.get("placed_by_pose"))
+            if res.meta.get("placed_by_pose"):
+                f["rank"] = 2
+            elif res.meta.get("placed_by_rgbd") or res.drawer_corners is not None or len(res.markers_px) >= 2:
+                f["rank"] = 0
+            else:
+                f["rank"] = 1 if res.markers_px else 2
         if visual_corners:
             # A blurred close view should not displace a sharper, slightly more
             # oblique view of the same tool merely because its camera is nearer.
@@ -1670,8 +1966,8 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
             results_kept, corners_list, frames, ppm, anchored, _, _ = _register(width_mm, height_mm)
     results = results_kept
     heights = [f["height"] for f in frames if f["height"] is not None]
-    from toolcutter.depth_fusion import fuse_heights
-    fused = fuse_heights(heights)
+    from toolcutter.depth_fusion import fuse_heights_with_support
+    fused, support = fuse_heights_with_support(heights, tol_mm=SUPPORT_TOL_MM)
     # Fusion can leave a residual floor offset/tilt even when each camera's plane
     # fit passed. Use the same floor reference as single captures; otherwise a
     # few millimetres of raised floor become bridges between unrelated tools.
@@ -1690,7 +1986,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     best = np.argmin(dists, axis=0)
     mosaic = _blend_mosaic(paint, best, 1.0 / ppm, fused)
     s = STORE.create(session_id=session_id, source_kind="capture", filename=form.get("filename") or "multi_capture.jpg", original=mosaic,
-                     original_height=fused, original_mm_per_px=1.0 / ppm,
+                     original_height=fused, original_support=support, original_mm_per_px=1.0 / ppm,
                      scan_meta={"mode": "multi_still", "frames_used": len(frames), "frames_skipped": skipped,
                                 "floor_relevel_mm": round(floor_shift, 1),
                                 "rgbd_registration": registration_info,
@@ -1699,9 +1995,11 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
                                 "drawer_from": drawer_from,
                                 # how each frame earned its place, so a new capture path can be diagnosed from the result
                                 "photo_coverage": coverage_report(paint, fused.shape if fused is not None else mosaic.shape[:2]),
-                                "placed_by": {"markers_2plus": sum(1 for f in frames if f["rank"] == 0) - chained,
+                                "marker_size_mm": marker_size, "marker_size_declared_mm": declared_marker,
+                                "placed_by": {"markers_2plus": max(0, sum(1 for f in frames if f["rank"] == 0) - chained - len(visual_corners)),
+                                              "rgbd_overlap": len(visual_corners),
                                               "one_marker": sum(1 for f in frames if f["rank"] == 1),
-                                              "pose_only": sum(1 for f in frames if f["rank"] == 2),
+                                              "pose_only": sum(1 for f in frames if f["rank"] == 2 and f.get("placed_by_pose")),
                                               "matched_to_neighbour": chained},
                                 "sensors": sorted({str(f.get("sensor") or "?") for f in frames_meta}),
                                 "marker_corners": None if not corner_map else {str(i): CORNER_NAMES[s_] for i, s_ in sorted(corner_map.items())},
@@ -1712,6 +2010,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
     s.frames = frames
     s.rectified = mosaic
     s.rect_height = fused
+    s.rect_support = support
     s.rect_frac = None
     s.mm_per_px = 1.0 / ppm
     s.mat_mm = (width_mm, height_mm)
@@ -1731,7 +2030,7 @@ def _build_multi_session(frames_meta: List[Dict], form: Dict, blobs: Dict[str, b
 @app.get("/api/marker_sheet.svg")
 def marker_sheet():
     """Printable corner markers (ids 0-3) at true scale, with a 100 mm check bar. Print at 100%."""
-    size = float(request.args.get("marker_mm") or 50.0)
+    size = float(request.args.get("marker_mm") or 25.0)   # default matches the app (25 mm since 2026-10-02)
     page_w, page_h = 215.9, 279.4  # US Letter
     d = cv2.aruco.getPredefinedDictionary(capmod.ARUCO_DICTS.get(request.args.get("dict") or "4X4_50", cv2.aruco.DICT_4X4_50))
     labels = ["TL  (id 0)", "TR  (id 1)", "BR  (id 2)", "BL  (id 3)"]
@@ -1740,7 +2039,8 @@ def marker_sheet():
     cols = 2
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{page_w}mm" height="{page_h}mm" viewBox="0 0 {page_w} {page_h}" font-family="Helvetica, Arial, sans-serif">',
            f'<text x="{page_w/2}" y="14" font-size="6" text-anchor="middle" font-weight="bold">ToolCutter drawer markers · {size:g} mm · print at 100% scale</text>',
-           f'<text x="{page_w/2}" y="21" font-size="3.4" text-anchor="middle">Cut each square on the dashed line and put one in each corner of the drawer, flat and upright, with the marker\'s outer corner touching the drawer corner. Any corner will do: which is which is read off their positions, not their numbers.</text>']
+           f'<text x="{page_w/2}" y="20" font-size="3.4" text-anchor="middle">Cut on the DASHED line — keep the white border. The camera finds a marker by the edge between black and white;</text>',
+           f'<text x="{page_w/2}" y="24.5" font-size="3.4" text-anchor="middle">cut to the black and it is invisible on a dark liner. Put one in each corner, flat, outer corner touching the drawer corner. Any corner will do.</text>']
     x0 = (page_w - cols * cell_pitch - 10) / 2
     y0 = 30.0
     for i in range(4):
@@ -1749,7 +2049,8 @@ def marker_sheet():
         bits = cv2.aruco.generateImageMarker(d, i, 6)  # 6x6 incl. black border
         n = bits.shape[0]
         cell = size / n
-        out.append(f'<rect x="{cx}" y="{cy}" width="{cell_pitch}" height="{cell_pitch}" fill="#fff" stroke="#999" stroke-width="0.25" stroke-dasharray="2 1.5"/>')
+        out.append(f'<rect x="{cx}" y="{cy}" width="{cell_pitch}" height="{cell_pitch}" fill="#fff" stroke="#555" stroke-width="0.4" stroke-dasharray="2 1.5"/>')
+        out.append(f'<text x="{cx + cell_pitch/2}" y="{cy - 1.5}" font-size="2.6" text-anchor="middle" fill="#555">✂ cut here · keep this white border</text>')
         for r in range(n):
             for c in range(n):
                 if bits[r, c] < 128:
@@ -1945,11 +2246,15 @@ def calibrate(sid: str):
 
 def _apply_calibration(s, ordered: np.ndarray, width_mm: float, height_mm: float) -> None:
     extra = [s.original_height, s.original_frac] if s.original_height is not None else None
+    if extra is not None and s.original_support is not None:
+        extra.append(s.original_support.astype(np.float32))
     warped, mm_per_px, H, extras = calibration.rectify(s.original, ordered, width_mm, height_mm, extra=extra,
                                                        already_ordered=True)
     s.rectified = warped
     s.rect_height = extras[0] if extras else None
     s.rect_frac = extras[1] if extras and len(extras) > 1 else None
+    sup = extras[2] if extras and len(extras) > 2 else None
+    s.rect_support = np.clip(np.rint(np.nan_to_num(sup)), 0, 255).astype(np.uint8) if sup is not None else None
     if s.rect_height is not None:
         # reference heights to the floor actually visible inside the mat rectangle
         levelled, shift = geometry.level_height_raster(s.rect_height)
@@ -2004,7 +2309,14 @@ def _marker_mask(s) -> np.ndarray:
                 quad = center + 1.5 * (quad - center)
                 cv2.fillConvexPoly(mask, np.rint(quad).astype(np.int32), 1)
     radius = max(1, int(round(1. / s.mm_per_px)))
-    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) > 0
+    out = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) > 0
+    # The zone is PAPER, and paper reads ~0 mm (a folded edge, 2-4 mm). Anything taller under it is a tool that
+    # happens to sit next to a marker, and erasing it carves a rectangular notch out of the tool: Nolan's hammer
+    # (2026-09-23, capture b59fc5fdd2d1) lost the corner of its striking face this way — 4.8 cm2 of a 28 mm-tall
+    # head zeroed by the top-left marker's quiet border. Keep the mask only where the height says paper.
+    if s.rect_height is not None:
+        out &= ~(np.nan_to_num(s.rect_height, nan=0.0) > MARKER_MASK_MAX_MM)
+    return out
 
 
 def _detect_photo_tools(s, body):
@@ -2138,11 +2450,117 @@ def auto_detect(sid: str):
     s = _require_rectified(_session(sid))
     body = request.get_json(force=True, silent=True) or {}
     mode = body.get("mode", "auto")
-    if mode not in ("auto", "height", "color"):
-        raise ApiError("mode must be auto | color | height")
+    if mode not in ("auto", "height", "color", "hybrid"):
+        raise ApiError("mode must be auto | color | height | hybrid")
+    if mode == "hybrid":
+        return jsonify(_detect_hybrid(s, body))
+    return jsonify(_auto_detect_impl(s, body))
+
+
+def _depth_coverage(s, mask: np.ndarray) -> Optional[float]:
+    """Fraction of a footprint the depth sensor actually measured (finite height). TrueDepth returns nothing on
+    black / glossy surfaces, so a WD drive can be a photo silhouette with 5 %% depth; the UI and the relief use this."""
+    if s.rect_height is None or mask is None or not mask.any():
+        return None
+    return round(float(np.isfinite(s.rect_height[mask]).mean()), 3)
+
+
+def _detect_hybrid(s, body: Dict) -> Dict:
+    """Tools = everything that stands up in the HEIGHT MAP, plus photo silhouettes (HQ-SAM) the depth sensor missed —
+    and where BOTH see an object, the PHOTO draws its footprint and the height map supplies its depth.
+
+    Nolan's desk drawer (a237eba87dba, 2026-10-03): the black WD drive, the glossy Anker power bank and the zipper
+    case returned almost no depth (22 %% of the drawer's cells had none), so height-only detection found 8 of 9
+    objects and the drive not at all; the photo found them all. Then "the shapes/outlines still look ugly": the
+    height blobs of objects the photo HAD outlined cleanly were half-covered (the case's bottom half returned no
+    depth, so its blob was a lumpy top half) and the old rule kept the blob and threw the silhouette away for
+    overlapping it. Now a height blob that lies >= 30 %% inside a photo silhouette is absorbed by it: the
+    silhouette is the footprint (`found_by: "both"`), the blob's cells remain the pocket's depth. A photo tool
+    with no blob is added when it is measurably tall (p95 >= 1.5 mm where depth exists) or big (>= 8 cm2 — a
+    flat-looking large silhouette is a dark object the sensor did not see, not a label). A silhouette mostly
+    (>= 60 %%) inside another is a part (a panel of the case) and is dropped. Each tool carries `depth_coverage`;
+    the relief fills a tool's depth holes from its measured parts."""
+    base = _auto_detect_impl(s, {**body, "mode": "height", "edge_source": "topo", "refine_with_sam": False})
+    tools = list(base.get("tools") or [])
+    for t in tools:
+        t["depth_coverage"] = _depth_coverage(s, s.masks.get(t["id"]))
+        t["found_by"] = "height"
+    if not SEGMENTER.available or s.rectified is None:
+        base["mode"] = "hybrid"; base["photo_added"] = 0
+        return base
+    try:
+        photo = _detect_photo_tools(s, {**body, "id_prefix": (body.get("id_prefix") or f"t{int(time.time()) % 100000}_") + "p"})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("hybrid detection: photo pass failed (%s); height tools only", exc)
+        base["mode"] = "hybrid"; base["photo_added"] = 0; base["sam_error"] = str(exc)
+        return base
+    shape = s.rect_height.shape
+    sils = []
+    for t in photo.get("tools") or []:
+        m = s.masks.get(t["id"])
+        if m is None or not m.any() or m.shape != shape or len(t.get("polygon_mm") or []) < 3:
+            s.masks.pop(t["id"], None); continue
+        sils.append((t, m.astype(bool)))
+    # a silhouette mostly inside a bigger one is a part of it, not a tool
+    sils.sort(key=lambda tm: -float(tm[1].sum()))
+    kept_sils = []
+    for t, m in sils:
+        area = float(m.sum())
+        if any(float((m & bm).sum()) / area >= 0.60 for _, bm in kept_sils):
+            s.masks.pop(t["id"], None); continue
+        kept_sils.append((t, m))
+    # height blobs that the photo outlined: the silhouette takes over the footprint
+    absorbed = set(); used_sil = set()
+    for t in tools:
+        bm = s.masks.get(t["id"])
+        if bm is None or bm.shape != shape or not bm.any():
+            continue
+        bm = bm.astype(bool); barea = float(bm.sum())
+        best, best_frac = None, 0.0
+        for st, sm in kept_sils:
+            frac = float((bm & sm).sum()) / barea
+            if frac > best_frac:
+                best, best_frac = st, frac
+        if best is not None and best_frac >= 0.30:
+            absorbed.add(t["id"]); used_sil.add(best["id"])
+            best["found_by"] = "both"
+            best.setdefault("absorbed_height_tools", []).append(t["id"])
+    for tid in absorbed:
+        s.masks.pop(tid, None)
+    tools = [t for t in tools if t["id"] not in absorbed]
+    union = np.zeros(shape, bool)
+    for t in tools:
+        m = s.masks.get(t["id"])
+        if m is not None and m.shape == shape:
+            union |= m.astype(bool)
+    added = 0; replaced = 0
+    for t, m in kept_sils:
+        if t["id"] in used_sil:
+            t["depth_coverage"] = _depth_coverage(s, m)
+            tools.append(t); union |= m; replaced += 1
+            continue
+        overlap = float((m & union).sum()) / float(m.sum())
+        if overlap >= 0.30:
+            s.masks.pop(t["id"], None); continue
+        stats = t.get("height_stats") or {}
+        tall = (stats.get("p95_mm") or 0.0) >= 1.5
+        big = float(t.get("area_mm2") or 0.0) >= 800.0
+        if not (tall or big):
+            s.masks.pop(t["id"], None); continue
+        t["depth_coverage"] = _depth_coverage(s, m)
+        t["found_by"] = "photo"
+        tools.append(t); union |= m; added += 1
+    base["tools"] = tools; base["mode"] = "hybrid"; base["photo_added"] = added; base["photo_footprints"] = replaced
+    log.info("hybrid detection: %d from the height map alone, %d photo footprints over height blobs, %d from the photo alone",
+             len(tools) - added - replaced, replaced, added)
+    return base
+
+
+def _auto_detect_impl(s, body: Dict) -> Dict:
+    mode = body.get("mode", "auto")
     if mode != "height" and SEGMENTER.available and _edge_source(s, body) == "photo":
         try:
-            return jsonify(_detect_photo_tools(s, body))
+            return _detect_photo_tools(s, body)
         except Exception as exc:
             log.exception("Photo tool discovery failed")
             raise ApiError("Photo detection failed. Try again or select depth-only detection in Settings.", 503) from exc
@@ -2217,12 +2635,24 @@ def auto_detect(sid: str):
                     if not np.isfinite(hs).any() or float(np.nanpercentile(hs, 90)) < TOOL_MIN_HEIGHT_MM:
                         i -= 1
                         continue
+                # A TOOL HAS TO BE SEEN BY MORE THAN ONE FRAME, AND THE FRAMES HAVE TO AGREE. `rect_support` counts
+                # the frames whose height matches the fused value per cell. On a237eba87dba every real tool had a
+                # median support of 2-7; the six ghosts (tall slivers left by one misplaced pose-chained frame, or
+                # the midpoint of two frames that disagreed) had 0-1. Judged per BLOB, not per cell, so a tool whose
+                # edge was seen once is not nibbled — only a blob that no second frame confirms is dropped.
+                if s.rect_support is not None and MIN_SUPPORT > 1 and comp.any():
+                    sup = s.rect_support[comp]
+                    if float(np.median(sup)) < MIN_SUPPORT:
+                        log.info("auto-detect: dropped a %.1f cm2 blob confirmed by %.0f frame(s) (ghost)",
+                                 comp.sum() * s.mm_per_px ** 2 / 100.0, float(np.median(sup)))
+                        i -= 1
+                        continue
                 dt = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
                 yy, xx = np.unravel_index(int(np.argmax(dt)), dt.shape)
                 ys, xs = np.nonzero(comp)
                 box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
                 tools.append(_topo_tool_result(s, f"{prefix}{i}", comp, [{"x": float(xx), "y": float(yy), "label": 1}], box, signed=signed))
-        return jsonify({"tools": tools, "mode": mode, "edge_source": "topo", "sam_used": False, "sam_error": None,
+        return ({"tools": tools, "mode": mode, "edge_source": "topo", "sam_used": False, "sam_error": None,
                         "foreground_fraction": float(fg.mean())})
     use_sam = refine and SEGMENTER.available
     sam_error = None
@@ -2272,7 +2702,7 @@ def auto_detect(sid: str):
                 log.warning("SAM refine failed for blob %d: %s", i, exc)
         tools.append(_tool_result(s, tid, mask, points, box, color_silhouette=from_color, frame_idx=fidx,
                                   blob=blob_for_tool if from_color else None))
-    return jsonify({"tools": tools, "mode": mode, "edge_source": "photo", "sam_used": use_sam, "sam_error": sam_error,
+    return ({"tools": tools, "mode": mode, "edge_source": "photo", "sam_used": use_sam, "sam_error": sam_error,
                     "foreground_fraction": float(fg.mean())})
 
 
@@ -2380,24 +2810,245 @@ def snap_base(sid: str):
     return jsonify({"polygon_px": out.tolist(), "polygon_mm": (out * s_.mm_per_px).tolist()})
 
 
-@app.post("/api/sessions/<sid>/split")
-def split_tool(sid: str):
-    """Cut one detected tool into two along a line the user dragged across it.
+_AGENT_JOBS: Dict[str, Dict] = {}
+_AGENT_LIVE: Dict[str, Any] = {}       # job id -> DrawerTools while the run is alive (live outline snapshots)
+_AGENT_LOCK = threading.Lock()
+AGENT_JOB_DIR = Path(os.environ.get("TC_AGENT_JOB_DIR") or Path(__file__).parent / "agent_jobs")
 
-    body: {tool_id, line: [[x0, y0], [x1, y1]] (rectified px), edge_source?}. The tool's mask is divided by the
-    (infinite) line; each side becomes a new tool whose border is re-derived from the topography (or the plain
-    mask outline when there is no height data). Returns {tools: [two tools]}.
+
+def _agent_job_public(job: Dict, with_result: bool = False) -> Dict:
+    out = {"id": job["id"], "session": job["session"], "status": job["status"], "error": job.get("error"), "started": job["started"],
+           "seconds": round((job.get("finished") or time.time()) - job["started"], 1), "dismissed": bool(job.get("dismissed")),
+           "log_total": len(job["log"]), "summary": (job.get("result") or {}).get("summary"),
+           "changed": len((job.get("result") or {}).get("changed") or []), "removed": len((job.get("result") or {}).get("removed") or [])}
+    if with_result:
+        out["result"] = job.get("result")
+    return out
+
+
+def _agent_job_save(job: Dict) -> None:
+    """Finished jobs go to disk so a proposal survives a backend restart (Nolan: 'I lose the agent if I change tabs
+    or drawers'). Running jobs live in memory only — their thread dies with the process."""
+    try:
+        AGENT_JOB_DIR.mkdir(parents=True, exist_ok=True)
+        (AGENT_JOB_DIR / f"{job['id']}.json").write_text(json.dumps(job))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not save agent job %s: %s", job["id"], exc)
+
+
+def _agent_jobs_load() -> None:
+    try:
+        files = sorted(AGENT_JOB_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)[-30:]
+    except OSError:
+        return
+    for f in files:
+        try:
+            job = json.loads(f.read_text())
+            if job.get("status") == "running":      # a process died mid-run
+                job["status"] = "error"; job["error"] = "the backend restarted while the agent was running"
+            _AGENT_JOBS.setdefault(job["id"], job)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("skipping agent job file %s: %s", f.name, exc)
+
+
+_agent_jobs_load()
+
+
+@app.post("/api/sessions/<sid>/agent")
+def start_agent(sid: str):
+    """Start the drawer agent (`toolcutter/agent.py`) on this scan's tools — Nolan's "more agentic/overall approach".
+
+    body: {tools: [{id, name, polygon_px}], instructions?}. The model gets tools to look (drawer, tool with marks,
+    height profile), act (split, merge, re-detect, edit by marks, fit shape, rename, remove) and check, and works until
+    it calls finish or the budget ends (TC_AGENT_MAX_CALLS 60, TC_AGENT_MAX_S 900). Runs on a thread; returns
+    {job_id}. Poll GET /api/agent/<job_id> for the live log and the result. The result is a PROPOSAL — the full tool
+    list with changed/new flags plus removed ids — applied by the UI on Accept. The server's masks are updated as the
+    agent splits/merges (new ids), which is harmless if the proposal is rejected.
     """
+    from toolcutter import agent as agentmod
+    s = _require_rectified(_session(sid))
+    if s.rect_height is None:
+        raise ApiError("The drawer agent needs a scan with height data.")
+    body = request.get_json(force=True, silent=True) or {}
+    items = [t for t in (body.get("tools") or []) if len(t.get("polygon_px") or []) >= 3]
+    if not items:
+        raise ApiError("Send tools: [{id, name, polygon_px}]")
+    instructions = str(body.get("instructions") or "")[:2000]
+    helpers = {"split_core": _split_core, "split_core_path": _split_core_path, "merge_core": _merge_core, "segment_topo": _segment_topo,
+               "depth_cell_mm": _depth_cell_mm, "split_at_saddles": geometry.split_at_saddles}
+    dt = agentmod.DrawerTools(s, items, helpers)
+    job_id = uuid.uuid4().hex[:12]
+    with _AGENT_LOCK:
+        if any(j["session"] == sid and j["status"] == "running" for j in _AGENT_JOBS.values()):
+            raise ApiError("The agent is already working on this drawer — wait for it or check its log.", 409)
+    job = {"id": job_id, "session": sid, "status": "running", "log": [], "result": None, "error": None, "started": time.time(),
+           "finished": None, "dismissed": False, "instructions": instructions}
+    _AGENT_LIVE[job_id] = dt          # kept out of the (JSON-serialised) job dict
+    with _AGENT_LOCK:
+        _AGENT_JOBS[job_id] = job
+        for old in sorted(_AGENT_JOBS.values(), key=lambda j: j["started"])[:-30]:
+            _AGENT_JOBS.pop(old["id"], None)
+
+    def _run():
+        try:
+            res = agentmod.run_drawer_agent(dt, instructions=instructions, log_cb=lambda e: job["log"].append(e))
+            job["result"] = res
+            job["status"] = "done"
+            log.info("agent %s on %s: %s after %d calls, %.0f s, %s tokens", job_id, sid, res["stopped"], res["calls"], res["seconds"], res["usage"])
+        except Exception as exc:  # noqa: BLE001
+            log.exception("agent %s failed", job_id)
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            job["status"] = "error"
+        job["finished"] = time.time()
+        _agent_job_save(job)
+
+    threading.Thread(target=_run, name=f"agent-{job_id}", daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.get("/api/sessions/<sid>/agent")
+def list_agent_jobs(sid: str):
+    """The agent jobs of one drawer, newest first — how the Outlines step finds a run again after a tab or drawer
+    change. Running jobs are still running; finished ones keep their proposal until it is dismissed (accepted or
+    rejected)."""
+    jobs = sorted((j for j in _AGENT_JOBS.values() if j["session"] == sid), key=lambda j: -j["started"])
+    return jsonify({"jobs": [_agent_job_public(j) for j in jobs[:10]]})
+
+
+@app.get("/api/agent/<job_id>")
+def agent_status(job_id: str):
+    job = _AGENT_JOBS.get(job_id)
+    if job is None:
+        raise ApiError("Unknown agent job (server restarted?)", 404)
+    since = int(request.args.get("since") or 0)
+    out = _agent_job_public(job)
+    out["log"] = job["log"][since:]
+    if job["status"] == "done" and request.args.get("result", "1") != "0":
+        out["result"] = job["result"]
+    dt = _AGENT_LIVE.get(job_id)
+    if job["status"] == "running" and dt is not None and request.args.get("live", "1") != "0":
+        out["live"] = dt.live()        # the working outlines right now, so the canvas can show the agent at work
+    if job["status"] != "running":
+        _AGENT_LIVE.pop(job_id, None)
+    return jsonify(out)
+
+
+@app.post("/api/agent/<job_id>/dismiss")
+def agent_dismiss(job_id: str):
+    """Accepted or rejected in the UI: the proposal is no longer offered on the next visit."""
+    job = _AGENT_JOBS.get(job_id)
+    if job is None:
+        raise ApiError("Unknown agent job", 404)
+    job["dismissed"] = True
+    if job["status"] != "running":
+        _agent_job_save(job)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/sessions/<sid>/cleanup")
+def cleanup_outlines(sid: str):
+    """Knowledge-driven outline cleanup — PROPOSALS ONLY, nothing is applied here.
+
+    body: {tools: [{id, polygon_px | polygon_mm, name?}], recognize?: bool (default true), verify?: bool (default true)}.
+    Per tool: the trace becomes a constant-step working ring with NUMBERED MARKS (`cleanup.prepare_ring`,
+    `mark_indices`); the model (`toolcutter.recognize.analyze`) inspects the full-resolution photo crop, the height
+    crop and the whole drawer, all with the trace and marks drawn on, and returns what the tool is, which constraints
+    its footprint obeys and WHERE the trace is wrong, by mark range. `cleanup.propose` applies those local edits
+    (measured on the trace or the photo, refused when unsupported) and then the global constraints. The proposal is
+    drawn green over the photo and shown back to the model (`verify`); any run it still objects to becomes one more
+    local edit and the proposal is rebuilt once. Without API credentials the engine runs on the trace alone.
+    Returns {proposals: [{id, name, recognition, verification, preview_png, polygon_px, polygon_mm, applied, refused,
+             max_move_mm, area_*}], recognition_available, recognition_reason}.
+    """
+    from concurrent.futures import ThreadPoolExecutor
     s = _require_rectified(_session(sid))
     body = request.get_json(force=True, silent=True) or {}
-    tid = str(body.get("tool_id") or "")
+    items = body.get("tools") or []
+    if not items:
+        raise ApiError("Send tools: [{id, polygon_px}]")
+    want_recog = bool(body.get("recognize", True))
+    want_verify = bool(body.get("verify", True)) and os.environ.get("TC_CLEANUP_VERIFY", "1") != "0"
+    mpp = float(s.mm_per_px)
+
+    def _one(item: Dict) -> Dict:
+        tid = str(item.get("id") or "")
+        name = str(item.get("name") or "")
+        if item.get("polygon_px"):
+            px = np.asarray(item["polygon_px"], dtype=np.float64)
+        else:
+            px = np.asarray(item.get("polygon_mm") or [], dtype=np.float64) / mpp
+        if px.ndim != 2 or len(px) < 3:
+            return {"id": tid, "error": "polygon needs at least 3 points"}
+        mm = px * mpp
+        ring = cleanupmod.prepare_ring(mm)
+        marks = cleanupmod.mark_indices(ring)
+        margin = int(round(10.0 / mpp))
+        photo_dim, hcrop, (x0, y0, x1, y1) = recognize.make_crops(s.rectified, s.rect_height, px, margin)
+        raw = s.rectified[y0:y1, x0:x1] if photo_dim is not None else None
+        origin_mm = np.array([x0, y0], dtype=np.float64) * mpp
+        ring_local = ring / mpp - [x0, y0]
+        recog = None
+        local: List[Dict] = []
+        if want_recog and photo_dim is not None:
+            thick = None
+            if hcrop is not None and (hcrop > 0).any():
+                thick = float(np.percentile(hcrop[hcrop > 0], 90))
+            (_, _), (rw, rh), _ = cv2.minAreaRect(mm.astype(np.float32))
+            pm, hm = recognize.annotate(photo_dim, hcrop, ring_local, marks, mpp)
+            ctx = recognize.context_image(s.rectified, px)
+            if os.environ.get("TC_RECOGNIZE_DUMP"):
+                d = os.environ["TC_RECOGNIZE_DUMP"]; os.makedirs(d, exist_ok=True)
+                stem = os.path.join(d, (name or tid or "tool").replace(" ", "_").replace("/", "_"))
+                cv2.imwrite(stem + "_photo.png", pm)
+                if hm is not None:
+                    cv2.imwrite(stem + "_height.png", hm)
+                cv2.imwrite(stem + "_context.png", ctx)
+            recog = recognize.analyze(pm, hm, ctx, name_hint=name, size_mm=(max(rw, rh), min(rw, rh)), thickness_mm=thick,
+                                      n_marks=len(marks), mpp=mpp)
+            if recog:
+                local = list(recog.get("edits") or [])
+        hints = recognize.hints_from(recog)
+        kw = dict(ring=ring, marks=marks, photo=raw, origin_mm=origin_mm, mpp=mpp)
+        prop = cleanupmod.propose(mm, hints, local=local, **kw)
+        verification = None
+        if want_recog and recog and photo_dim is not None and prop["applied"]:
+            out_mm = np.asarray(prop["polygon_mm"], dtype=np.float64)
+            preview = recognize.render_preview(raw, ring_local, out_mm / mpp - [x0, y0], marks, mpp)
+            if want_verify:
+                verification = recognize.verify(preview, name_hint=recog.get("tool_name") or name, n_marks=len(marks), mpp=mpp)
+                if verification and verification.get("issues"):
+                    # one more round: its objections are more local edits on the SAME marks
+                    prop2 = cleanupmod.propose(mm, hints, local=local + verification["issues"], **kw)
+                    if prop2["applied"]:
+                        prop = prop2
+                        verification["second_round"] = True
+                if verification and not verification.get("better_than_orange", True) and not verification.get("issues"):
+                    prop["refused"].append({"type": "all", "refused": "the model judged the proposal no better than the trace"})
+                    prop["applied"] = []
+        if photo_dim is not None and prop["applied"]:
+            out_mm = np.asarray(prop["polygon_mm"], dtype=np.float64)
+            preview = recognize.render_preview(raw, ring_local, out_mm / mpp - [x0, y0], marks, mpp)
+            prop["preview_png"] = recognize._png_b64(preview, max_side=900)
+        out_mm = np.asarray(prop["polygon_mm"], dtype=np.float64)
+        prop.update({"id": tid, "name": name or None, "recognition": recog, "verification": verification, "hints": hints,
+                     "n_marks": len(marks), "polygon_px": (out_mm / mpp).tolist()})
+        return prop
+
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("TC_CLEANUP_WORKERS", "4"))) as ex:
+        proposals = list(ex.map(_one, items))
+    available = any(p.get("recognition") for p in proposals)
+    log.info("cleanup %s: %d tools, recognition %s", sid, len(proposals), "on" if available else "unavailable")
+    return jsonify({"proposals": proposals, "recognition_available": available,
+                    "recognition_reason": None if available else (recognize.unavailable_reason() or "no recognition result")})
+
+
+def _split_core(s, tid: str, line: List[List[float]], prefix: str, body: Optional[Dict] = None) -> List[Dict]:
+    """Divide tool `tid`'s stored mask by the infinite line through the two points (rectified px) and re-derive each
+    side; returns the new tool results (>= 2) and drops the old mask. Shared by the /split route and the drawer agent."""
     mask = s.masks.get(tid)
     if mask is None:
         raise ApiError("Unknown tool (nothing to split); detect or click it first.", 404)
-    try:
-        (x0, y0), (x1, y1) = [(float(p[0]), float(p[1])) for p in body["line"]]
-    except (KeyError, TypeError, ValueError, IndexError):
-        raise ApiError("line must be [[x0, y0], [x1, y1]] in image pixels")
+    (x0, y0), (x1, y1) = [(float(p[0]), float(p[1])) for p in line]
     if math.hypot(x1 - x0, y1 - y0) < 2:
         raise ApiError("Drag a longer line across the tool")
     H, W = mask.shape
@@ -2406,9 +3057,43 @@ def split_tool(sid: str):
     # a 1.5 mm-wide seam along the cut so the two parts do not touch
     seam = np.abs(side) / math.hypot(x1 - x0, y1 - y0) < max(1.0, 0.75 / s.mm_per_px)
     parts = [mask & (side > 0) & ~seam, mask & (side < 0) & ~seam]
+    return _split_core_parts(s, tid, parts, seam, prefix, body)
+
+
+def _split_core_path(s, tid: str, path_px: np.ndarray, prefix: str, body: Optional[Dict] = None) -> List[Dict]:
+    """Divide tool `tid`'s mask along a POLYLINE (rectified px) — the drawer agent's valley cut, which follows the
+    lowest ground between two merged objects instead of a straight line that clips one of them. The seam is drawn
+    1.5 mm wide; what is left falls into components, the two biggest are the sides and every smaller crumb joins the
+    nearer of them."""
+    mask = s.masks.get(tid)
+    if mask is None:
+        raise ApiError("Unknown tool (nothing to split); detect or click it first.", 404)
+    pts = np.round(np.asarray(path_px, dtype=np.float64)).astype(np.int32)
+    if len(pts) < 2:
+        raise ApiError("The cut needs at least two points")
+    seam_img = np.zeros(mask.shape, np.uint8)
+    cv2.polylines(seam_img, [pts.reshape(-1, 1, 2)], False, 1, max(2, int(round(1.5 / s.mm_per_px))))
+    seam = seam_img.astype(bool)
+    rest = mask & ~seam
+    n, lab = cv2.connectedComponents(rest.astype(np.uint8), connectivity=8)
+    if n < 3:
+        raise ApiError("That cut does not divide the tool into two pieces — it must run from edge to edge.")
+    areas = [(int((lab == k).sum()), k) for k in range(1, n)]
+    areas.sort(reverse=True)
+    big = [lab == areas[0][1], lab == areas[1][1]]
+    dts = [cv2.distanceTransform((~b).astype(np.uint8), cv2.DIST_L2, 3) for b in big]
+    for _, k in areas[2:]:
+        comp = lab == k
+        ys, xs = np.nonzero(comp)
+        d0 = dts[0][ys, xs].mean(); d1 = dts[1][ys, xs].mean()
+        big[0 if d0 <= d1 else 1] |= comp
+    return _split_core_parts(s, tid, big, seam, prefix, body)
+
+
+def _split_core_parts(s, tid: str, parts: List[np.ndarray], seam: np.ndarray, prefix: str, body: Optional[Dict] = None) -> List[Dict]:
+    mask = s.masks[tid]
     min_px = 40.0 / s.mm_per_px ** 2
     out = []
-    prefix = body.get("id_prefix") or f"s{int(time.time()) % 100000}_"
     cell = _depth_cell_mm(s)
     n = 0
     for part in parts:
@@ -2429,7 +3114,7 @@ def split_tool(sid: str):
         pts = [{"x": float(px), "y": float(py), "label": 1}]
         ys, xs = np.nonzero(piece)
         box = [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
-        if s.rect_height is not None and _edge_source(s, body) == "topo":
+        if s.rect_height is not None and _edge_source(s, body or {}) == "topo":
             fld = {}
             tm = geometry.topo_footprint(s.rect_height, piece, s.mm_per_px, cell_mm=cell, restrict=piece | seam, field_out=fld)
             out.append(_topo_tool_result(s, nid, tm if tm.any() else piece, pts, box, signed=fld.get("signed")))
@@ -2438,28 +3123,33 @@ def split_tool(sid: str):
     if len(out) < 2:
         raise ApiError("That line does not divide the tool into two pieces — drag it across the join.")
     s.masks.pop(tid, None)
-    return jsonify({"tools": out, "removed": tid})
+    return out
 
 
-@app.post("/api/sessions/<sid>/merge")
-def merge_tools(sid: str):
-    """Combine several tools into one — the inverse of /split.
+@app.post("/api/sessions/<sid>/split")
+def split_tool(sid: str):
+    """Cut one detected tool into two along a line the user dragged across it.
 
-    body: {tool_ids: [...], bridge_mm?}. The tools' stored masks are unioned and the seam between them is
-    healed by a closing of `bridge_mm` (default 2.0, capped at 6.0 — a wide closing fills T/L inner corners,
-    which is why the reconnection elsewhere in this file is held to 2 mm). Parts that are still apart after
-    that are joined by a straight bridge of the same width between their nearest points, so the call always
-    yields ONE outline; `bridged_mm` reports the widest gap that had to be crossed, and the UI says so.
-
-    The parts' own edges are kept as they were derived — the union is NOT re-thresholded. Each part was already
-    traced against its own local topography, and re-deriving the whole would judge a small part against the
-    tall one's top and eat it. Returns {tools: [one], removed: [ids]}.
+    body: {tool_id, line: [[x0, y0], [x1, y1]] (rectified px), edge_source?}. The tool's mask is divided by the
+    (infinite) line; each side becomes a new tool whose border is re-derived from the topography (or the plain
+    mask outline when there is no height data). Returns {tools: [two tools]}.
     """
     s = _require_rectified(_session(sid))
     body = request.get_json(force=True, silent=True) or {}
-    ids = [str(t) for t in (body.get("tool_ids") or []) if str(t)]
-    if len(ids) < 2:
-        raise ApiError("Select at least two tools to combine.")
+    tid = str(body.get("tool_id") or "")
+    try:
+        line = [[float(p[0]), float(p[1])] for p in body["line"]]
+        assert len(line) == 2
+    except (KeyError, TypeError, ValueError, IndexError, AssertionError):
+        raise ApiError("line must be [[x0, y0], [x1, y1]] in image pixels")
+    prefix = body.get("id_prefix") or f"s{int(time.time()) % 100000}_"
+    out = _split_core(s, tid, line, prefix, body)
+    return jsonify({"tools": out, "removed": tid})
+
+
+def _merge_core(s, ids: List[str], bridge_mm: float = 2.0, nid: Optional[str] = None) -> Tuple[Dict, float]:
+    """Union the tools' masks, heal the seam, bridge what is still apart, re-derive ONE tool. Returns (tool, bridged_mm)
+    and drops the old masks. Shared by the /merge route and the drawer agent."""
     missing = [t for t in ids if s.masks.get(t) is None]
     if missing:
         raise ApiError(f"Unknown tool(s) in this scan: {', '.join(missing)}. "
@@ -2468,7 +3158,7 @@ def merge_tools(sid: str):
     union = np.zeros_like(masks[0], dtype=bool)
     for m in masks:
         union |= m.astype(bool)
-    bridge_mm = min(6.0, max(0.0, _f(body, "bridge_mm", 2.0) or 0.0))
+    bridge_mm = min(6.0, max(0.0, float(bridge_mm)))
     if bridge_mm > 0:
         k = max(3, int(round(bridge_mm / s.mm_per_px)) | 1)
         union = cv2.morphologyEx(union.astype(np.uint8), cv2.MORPH_CLOSE,
@@ -2498,7 +3188,7 @@ def merge_tools(sid: str):
         comps = geometry.split_components(union, 1.0)
     if not union.any():
         raise ApiError("Those tools have no scanned area to combine.")
-    nid = str(body.get("id") or f"m{int(time.time()) % 100000}_1")
+    nid = str(nid or f"m{int(time.time()) % 100000}_1")
     dt = cv2.distanceTransform(union.astype(np.uint8), cv2.DIST_L2, 3)
     py, px = np.unravel_index(int(np.argmax(dt)), dt.shape)
     ys, xs = np.nonzero(union)
@@ -2506,6 +3196,29 @@ def merge_tools(sid: str):
     tool = _topo_tool_result(s, nid, union, [{"x": float(px), "y": float(py), "label": 1}], box)
     for t in ids:
         s.masks.pop(t, None)
+    return tool, bridged_mm
+
+
+@app.post("/api/sessions/<sid>/merge")
+def merge_tools(sid: str):
+    """Combine several tools into one — the inverse of /split.
+
+    body: {tool_ids: [...], bridge_mm?}. The tools' stored masks are unioned and the seam between them is
+    healed by a closing of `bridge_mm` (default 2.0, capped at 6.0 — a wide closing fills T/L inner corners,
+    which is why the reconnection elsewhere in this file is held to 2 mm). Parts that are still apart after
+    that are joined by a straight bridge of the same width between their nearest points, so the call always
+    yields ONE outline; `bridged_mm` reports the widest gap that had to be crossed, and the UI says so.
+
+    The parts' own edges are kept as they were derived — the union is NOT re-thresholded. Each part was already
+    traced against its own local topography, and re-deriving the whole would judge a small part against the
+    tall one's top and eat it. Returns {tools: [one], removed: [ids]}.
+    """
+    s = _require_rectified(_session(sid))
+    body = request.get_json(force=True, silent=True) or {}
+    ids = [str(t) for t in (body.get("tool_ids") or []) if str(t)]
+    if len(ids) < 2:
+        raise ApiError("Select at least two tools to combine.")
+    tool, bridged_mm = _merge_core(s, ids, _f(body, "bridge_mm", 2.0) or 0.0, body.get("id"))
     return jsonify({"tools": [tool], "removed": ids, "bridged_mm": round(bridged_mm, 1)})
 
 
@@ -2681,6 +3394,7 @@ def _compute_layout(body: Dict) -> Dict:
     simplify = _f(body, "simplify_mm", 0.15) or 0.15
     default_clearance = _f(body, "default_clearance_mm", 1.0) or 0.0
     mirror = bool(body.get("mirror", False))
+    finish = bool(body.get("finish_footprints", True))
     tools_out = []
     for t in body.get("tools") or []:
         if not t.get("include", True):
@@ -2698,6 +3412,8 @@ def _compute_layout(body: Dict) -> Dict:
             smoothing_mm=smoothing,
             notch=notch,
             simplify_mm=simplify,
+            exact=bool(t.get("shape")) or str(t.get("source") or "") == "shape",
+            finish=finish,
         )
         depth = _f(t, "depth_mm", None)
         entry = {
@@ -2711,6 +3427,7 @@ def _compute_layout(body: Dict) -> Dict:
             "bbox_mm": res["bbox_mm"],
             "centroid_mm": res["centroid_mm"],
             "notch": res.get("notch"),
+            "footprint": res.get("footprint"),
             "shapely": res.get("shapely"),
         }
         if mirror:
@@ -2758,6 +3475,7 @@ def _geometry_for_tool(raw: Dict):
     mask = sess.masks.get(str(raw.get("id")))
     if mask is None or mask.shape != sess.rect_height.shape:
         return None
+    height = _trusted_height(sess)
     poly = raw.get("polygon_mm")
     if poly and len(poly) >= 3 and sess.homography is None:
         # a hand-edited outline: the body follows the edited polygon; where it reaches outside the scanned mask the
@@ -2767,11 +3485,33 @@ def _geometry_for_tool(raw: Dict):
         cv2.fillPoly(edited, [np.round(pts).astype(np.int32)], 1)
         edited = edited > 0
         if edited.any() and not np.array_equal(edited, mask):
-            h = sess.rect_height
+            h = height
             fill = float(np.nanmedian(h[mask])) if mask.any() else float(np.nanmedian(h[edited]))
             h2 = np.where(mask, h, fill).astype(np.float32)
             return edited, h2, sess.mm_per_px
-    return mask, sess.rect_height, sess.mm_per_px
+    return mask, height, sess.mm_per_px
+
+
+def _trusted_height(sess) -> np.ndarray:
+    """The fused height with every raised cell that fewer than MIN_SUPPORT frames confirm turned into a hole (NaN).
+    A ghost's height inside a photo silhouette would otherwise become the pocket's depth: on a237eba87dba the power
+    bank's silhouette had 10 %% depth coverage and part of that was a sliver from one misplaced frame. The relief
+    fills holes from the tool's own measured cells, so a hole is the honest value here. Floor cells are left alone
+    (seen once is fine for 0 mm)."""
+    h = sess.rect_height
+    if h is None or sess.rect_support is None or MIN_SUPPORT <= 1 or sess.rect_support.shape != h.shape:
+        return h
+    cached = getattr(sess, "_trusted_height_cache", None)
+    if cached is not None and cached[0] == sess.version and cached[1].shape == h.shape:
+        return cached[1]
+    with np.errstate(invalid="ignore"):
+        ghost = (h > 1.0) & (sess.rect_support < MIN_SUPPORT)
+    out = np.where(ghost, np.nan, h).astype(np.float32)
+    try:
+        sess._trusted_height_cache = (sess.version, out)
+    except Exception:  # noqa: BLE001  (frozen/slots sessions: just recompute next time)
+        pass
+    return out
 
 
 @app.post("/api/layout")
@@ -2814,6 +3554,178 @@ def export(sid: Optional[str] = None):
     raise ApiError("format must be svg | dxf | stl | stl_tools")
 
 
+_SOLID_CACHE: Dict[str, Dict] = {}     # (session, tool id, area) -> recognition answer; the question does not change
+
+
+def _image_for_tool(raw: Dict) -> Optional[np.ndarray]:
+    """The rectified photo (grey) of the tool's session, for photo-guided filtering of its relief."""
+    sid = raw.get("session_id")
+    sess = STORE.get(sid) if sid else None
+    if sess is None or sess.rectified is None:
+        return None
+    return cv2.cvtColor(sess.rectified, cv2.COLOR_BGR2GRAY)
+
+
+def _solid_hint_for_tool(raw: Dict, hg: np.ndarray, inside: np.ndarray) -> Optional[Dict]:
+    """Ask the recognition model which solid this is (cached per tool); None when the model is unavailable."""
+    if recognize.unavailable_reason():
+        return None
+    sid = raw.get("session_id"); tid = str(raw.get("id"))
+    sess = STORE.get(sid) if sid else None
+    if sess is None or sess.rectified is None:
+        return None
+    mask = sess.masks.get(tid)
+    key = f"{sid}:{tid}:{int(mask.sum()) if mask is not None else 0}"
+    if key in _SOLID_CACHE:
+        return _SOLID_CACHE[key]
+    if mask is None or not mask.any():
+        return None
+    ys, xs = np.nonzero(mask)
+    m = int(round(8.0 / sess.mm_per_px))
+    y0, y1 = max(0, ys.min() - m), min(mask.shape[0], ys.max() + m + 1)
+    x0, x1 = max(0, xs.min() - m), min(mask.shape[1], xs.max() + m + 1)
+    photo = sess.rectified[y0:y1, x0:x1].copy()
+    dim = ~mask[y0:y1, x0:x1]
+    photo[dim] = (photo[dim] * 0.4).astype(np.uint8)
+    hcrop = None
+    if sess.rect_height is not None:
+        hcrop = np.where(mask[y0:y1, x0:x1], np.nan_to_num(sess.rect_height[y0:y1, x0:x1]), 0.0).astype(np.float32)
+    (_, _), (rw, rh), _ = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+    thick = float(np.percentile(hg[inside], 90)) if inside.any() else None
+    ans = recognize.solid_class(photo, hcrop, name_hint=str(raw.get("name") or ""), size_mm=(max(rw, rh) * sess.mm_per_px, min(rw, rh) * sess.mm_per_px), thickness_mm=thick)
+    if ans is not None:
+        _SOLID_CACHE[key] = ans
+        log.info("solid class for %s: %s (%s, symmetric %s, %.2f)", tid, ans.get("tool_name"), ans.get("solid_class"), ans.get("symmetric"), float(ans.get("confidence") or 0))
+    return ans
+
+
+def _relief_settings(body: Dict) -> Dict:
+    r = body.get("relief") or {}
+    g = lambda k, d: (_f(r, k, d) if _f(r, k, d) is not None else d)   # noqa: E731
+    return {"res_mm": min(5.0, max(0.3, g("resolution_mm", 1.0))), "smooth_mm": max(0.0, g("smooth_mm", 2.5)),
+            "z_clearance_mm": max(0.0, g("z_clearance_mm", 1.0)), "floor_min_mm": max(0.5, g("floor_min_mm", 2.0)),
+            "foam_thickness_mm": max(3.0, g("mat_thickness_mm", float((body.get("export") or {}).get("mat_thickness_mm", 30.0) or 30.0))),
+            "default_style": str(r.get("default_style") or "relief"),
+            "clean_solids": bool(r.get("clean_solids", True)), "semantic": bool(r.get("semantic", True)),
+            "cnc": {"cutter_mm": max(0.5, g("cutter_mm", 6.0)), "stepover_mm": max(0.2, g("stepover_mm", 2.0)), "stepdown_mm": max(0.5, g("stepdown_mm", 6.0)),
+                    "feed_mm_min": max(10.0, g("feed_mm_min", 1500.0)), "plunge_mm_min": max(10.0, g("plunge_mm_min", 500.0)),
+                    "safe_z_mm": max(1.0, g("safe_z_mm", 5.0)), "spindle_rpm": int(g("spindle_rpm", 12000))}}
+
+
+@app.post("/api/relief")
+@app.post("/api/sessions/<sid>/relief")
+def relief_export(sid: Optional[str] = None):
+    """Form-fit (3D) pockets — Nolan: "taking the height map, smoothing it, and cutting those shapes directly into the
+    foam via CNC". Body = the /api/layout body plus `relief` {resolution_mm, smooth_mm, z_clearance_mm, floor_min_mm,
+    mat_thickness_mm, default_style: relief|flat, cutter_mm, stepover_mm, stepdown_mm, feed_mm_min, plunge_mm_min,
+    safe_z_mm, spindle_rpm} and `format`: grid (JSON for the 3D preview: the carved top surface as a heightfield with
+    z <= 0 relative to the foam top, plus per-tool depths) | stl | png (16-bit depth map + sidecar JSON in a zip) |
+    gcode (GRBL raster finishing, flat end mill). Per tool, `pocket_style` in the tool entry overrides the default;
+    a relief pocket needs the tool's scan in memory (`_geometry_for_tool`), otherwise it is cut flat at its depth."""
+    body = request.get_json(force=True, silent=True) or {}
+    fmt = (body.get("format") or "grid").lower()
+    lay = _compute_layout(body)
+    st = _relief_settings(body)
+    cnc = st.pop("cnc")
+    semantic = st.pop("semantic")
+    if semantic and st["clean_solids"] and not recognize.unavailable_reason():
+        # warm the solid-class cache for every relief tool in parallel: 14 sequential calls took 58 s on the desk drawer
+        from concurrent.futures import ThreadPoolExecutor
+        todo = [t for t in lay["tools"] if str((t.get("raw") or {}).get("pocket_style") or st["default_style"]).lower() == "relief"]
+        def _warm(t):
+            raw = t.get("raw") or {}
+            g = _geometry_for_tool(raw)
+            if g is None:
+                return
+            mask, height, _ = g
+            hg = np.nan_to_num(height); inside = mask.astype(bool)
+            try:
+                _solid_hint_for_tool(raw, hg, inside)
+            except Exception as exc:  # noqa: BLE001
+                log.info("solid hint for %s failed: %s", raw.get("id"), exc)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(_warm, todo))
+    rel = reliefmod.build_depth_map(lay, _geometry_for_tool, image_for_tool=_image_for_tool,
+                                    solid_hint_for_tool=_solid_hint_for_tool if (semantic and st["clean_solids"]) else None, **st)
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", ((body.get("export") or {}).get("filename") or "tool_foam_relief")).strip("_") or "tool_foam_relief"
+    if fmt == "grid":
+        D = rel["depth"]
+        payload = _heightfield_payload(-D, rel["res_mm"], rel["res_mm"])
+        payload.update({"thickness_mm": rel["thickness_mm"], "max_depth_mm": float(D.max()) if D.size else 0.0, "tools": rel["tools"]})
+        return jsonify(payload)
+    if fmt == "stl":
+        data = reliefmod.depth_to_stl(rel)
+        return send_file(io.BytesIO(data), mimetype="model/stl", as_attachment=not bool(body.get("inline")), download_name=f"{base}_relief.stl")
+    if fmt == "png":
+        import zipfile
+        png, meta = reliefmod.depth_to_png16(rel)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"{base}_depth16.png", png)
+            z.writestr(f"{base}_depth16.json", json.dumps(meta, indent=2))
+            z.writestr("README.txt", "16-bit depth map of the foam block: 0 = top surface, 65535 = deepest point (see max_depth_mm in the JSON).\n"
+                                     "One pixel = mm_per_px millimetres. Import as a relief / height map in your CAM (invert if it expects white = high).\n")
+        return send_file(io.BytesIO(buf.getvalue()), mimetype="application/zip", as_attachment=True, download_name=f"{base}_depthmap.zip")
+    if fmt == "gcode":
+        text, stats = reliefmod.depth_to_gcode(rel, **cnc)
+        log.info("relief gcode %s: %s", base, stats)
+        resp = send_file(io.BytesIO(text.encode("utf-8")), mimetype="text/plain", as_attachment=True, download_name=f"{base}_relief.nc")
+        resp.headers["X-Gcode-Stats"] = json.dumps(stats)
+        return resp
+    if fmt == "package":
+        # everything the shop needs in one zip: G-code, carved STL, depth map, the flat 2D files, and a job sheet
+        import zipfile
+        text, stats = reliefmod.depth_to_gcode(rel, **cnc)
+        png, meta = reliefmod.depth_to_png16(rel)
+        opts = body.get("export") or {}
+        svg = layout_to_svg(lay, include_mat=True, include_labels=True, fill_mode="none", stroke_mm=0.2)
+        dxf = layout_to_dxf(lay, include_mat=True, include_labels=True)
+        sheet = [f"ToolFoam Pro job sheet — {base}", "",
+                 f"Block: {rel['width_mm']:.1f} x {rel['height_mm']:.1f} x {rel['thickness_mm']:.1f} mm foam",
+                 f"Pockets: {len(rel['tools'])} ({sum(1 for t in rel['tools'] if t['style'] == 'relief')} form-fit, {sum(1 for t in rel['tools'] if t['style'] != 'relief')} flat)",
+                 f"Deepest cut: {stats['deepest_mm']} mm (floor kept >= {st['floor_min_mm']} mm)",
+                 f"Depth map grid: {rel['res_mm']} mm, surface smoothing {st['smooth_mm']} mm, depth clearance {st['z_clearance_mm']} mm", "",
+                 f"G-code: {base}_relief.nc — GRBL, flat end mill {cnc['cutter_mm']} mm, stepover {cnc['stepover_mm']} mm, step-down {cnc['stepdown_mm']} mm,",
+                 f"        feed {cnc['feed_mm_min']:.0f} / plunge {cnc['plunge_mm_min']:.0f} mm/min, safe Z {cnc['safe_z_mm']} mm, spindle {cnc['spindle_rpm']} rpm",
+                 f"        {stats['layers']} layers, {stats['runs']} passes, {stats['cut_length_mm'] / 1000:.1f} m of cutting, about {stats['est_minutes']} min",
+                 "        Z = 0 at the FOAM TOP, origin at the block's near-left corner (X right, Y away). Simulate before the first cut.", "",
+                 f"3D model: {base}_relief.stl (the carved block, mm)", f"Depth map: {base}_depth16.png + .json (16-bit, 0 = top, see grey_to_mm)",
+                 f"Flat outlines: {base}.svg / {base}.dxf (pocket outlines with clearance, one colour/layer per depth)", "", "Tools:"]
+        names = {t["id"]: t.get("name") for t in lay["tools"]}
+        for t in rel["tools"]:
+            sheet.append(f"  - {names.get(t['id'], t['id'])}: {t['style']}, {t['min_depth_mm']}–{t['max_depth_mm']} mm deep")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"{base}_relief.nc", text)
+            z.writestr(f"{base}_relief.stl", reliefmod.depth_to_stl(rel))
+            z.writestr(f"{base}_depth16.png", png)
+            z.writestr(f"{base}_depth16.json", json.dumps(meta, indent=2))
+            z.writestr(f"{base}.svg", svg)
+            z.writestr(f"{base}.dxf", dxf)
+            z.writestr("JOB_SHEET.txt", "\n".join(sheet) + "\n")
+        resp = send_file(io.BytesIO(buf.getvalue()), mimetype="application/zip", as_attachment=True, download_name=f"{base}_cnc_package.zip")
+        resp.headers["X-Gcode-Stats"] = json.dumps(stats)
+        return resp
+    raise ApiError("format must be grid | stl | png | gcode | package")
+
+
+def _prune_processed(keep: int = int(os.environ.get("TC_KEEP_PROCESSED", "3"))):
+    """Delete processed snapshots (`captures/<id>/processed*`) for all but the newest `keep` captures.
+    A snapshot is ~3 GB for a 118-frame sweep (per-frame rasters); raw frames are kept, so a pruned capture simply
+    rebuilds on demand. Called after every save."""
+    try:
+        dirs = sorted((d for d in CAPTURE_DIR.iterdir() if (d / "capture.json").is_file()),
+                      key=lambda d: (d / "capture.json").stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for d in dirs[keep:]:
+        for p in d.glob("processed*"):
+            try:
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+            except OSError:
+                pass
+
+
 def _warm_saved_captures():
     """Restore ready snapshots only; do not compete with detection by rebuilding old scans."""
     from toolcutter.processed_cache import load_session, load_detection
@@ -2829,7 +3741,49 @@ def _warm_saved_captures():
             log.info("restored processed capture %s", cached.id)
 
 
+def _load_env_file(path: Path) -> int:
+    """Read KEY=VALUE lines from backend/.env into the environment (never overriding what the shell set). This is
+    where the Anthropic API key for outline cleanup lives on a dev Mac; the file is gitignored."""
+    n = 0
+    if not path.exists():
+        return 0
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+            n += 1
+    return n
+
+
+def _raise_fd_limit() -> None:
+    """A processed-capture snapshot (`toolcutter/processed_cache.py`) memory-maps ~2,300 small .npy files per drawer
+    and every memmap holds a file descriptor for the array's lifetime, so two warm drawers (4,800 fds) ran the server
+    into "OSError: [Errno 24] Too many open files" the moment the cleanup endpoint imported the anthropic SDK
+    (2026-10-02). Lift the soft limit to the hard limit at startup; macOS hands out a low soft limit by default."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard != resource.RLIM_INFINITY else 1 << 20
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            log.info("open-file limit raised %d -> %d (memory-mapped snapshots hold one fd per array)", soft, want)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not raise the open-file limit: %s", exc)
+
+
 def main():
+    _raise_fd_limit()
+    loaded = _load_env_file(Path(__file__).parent / ".env")
+    if loaded:
+        log.info("loaded %d setting(s) from backend/.env", loaded)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        log.info("Anthropic API key present — outline cleanup will use the model")
+    else:
+        log.info("no ANTHROPIC_API_KEY — outline cleanup runs on the trace alone (put the key in backend/.env)")
     ap = argparse.ArgumentParser(description="ToolCutter API server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)

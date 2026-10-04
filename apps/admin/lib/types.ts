@@ -54,6 +54,8 @@ export interface ToolResult {
   id: string;
   session_id: string;
   name?: string;
+  depth_coverage?: number | null;
+  edge_source?: string;
   points: { x: number; y: number; label: number }[];
   box: number[] | null;
   polygon_px: number[][];
@@ -100,6 +102,10 @@ export interface Tool {
   edited?: boolean;
   /** a drawn primitive (source 'shape'): its parameters, so the size stays editable */
   shape?: ShapeSpec;
+  /** per-tool pocket style override (the layout setting is the default) */
+  pocket_style?: 'flat' | 'relief';
+  /** fraction of the footprint the depth sensor actually measured (black / glossy objects return no depth) */
+  depth_coverage?: number | null;
 }
 
 export type ShapeKind = 'rect' | 'circle' | 'slot' | 'hex' | 'poly';
@@ -115,6 +121,10 @@ export interface LayoutTool {
   bbox_mm: number[] | null;
   centroid_mm: number[] | null;
   notch: Notch | null;
+  /** How the server finished a scanned footprint: snapped to a primitive (with its size and how well it fit the
+   *  scan) or re-expressed as a smooth enclosing outline. null for drawn shapes. */
+  footprint?: { kind: 'rectangle' | 'rounded_rectangle' | 'capsule' | 'circle' | 'smooth' | 'none'; iou?: number;
+    w_mm?: number; h_mm?: number; r_mm?: number; diameter_mm?: number; vertices?: number; grown_mm?: number } | null;
   outside_mat: boolean;
   overlaps: string[];
 }
@@ -140,6 +150,22 @@ export interface LayoutSettings {
   fill_mode: 'none' | 'fill';
   mat_thickness_mm: number;
   notch_diameter_mm: number;
+  /** flat pockets at one depth per tool, or 3D form-fit pockets whose floor follows the scanned tool (relief) */
+  pocket_style: 'flat' | 'relief';
+  relief_smooth_mm: number;
+  relief_clearance_mm: number;   // extra depth under the tool's surface
+  relief_resolution_mm: number;  // depth-map grid
+  /** clean each tool's 3D shape before carving: photo-guided filtering, mirror symmetry, box / cylinder / extrusion fits */
+  relief_clean_solids: boolean;
+  /** let the recognition model pick the solid class (box, cylinder, ...) — needs an Anthropic key on the server */
+  relief_semantic: boolean;
+  cnc_cutter_mm: number;
+  cnc_stepover_mm: number;
+  cnc_stepdown_mm: number;
+  cnc_feed_mm_min: number;
+  cnc_plunge_mm_min: number;
+  cnc_safe_z_mm: number;
+  cnc_spindle_rpm: number;
 }
 
 export const DEFAULT_SETTINGS: LayoutSettings = {
@@ -155,6 +181,19 @@ export const DEFAULT_SETTINGS: LayoutSettings = {
   fill_mode: 'none',
   mat_thickness_mm: 30,
   notch_diameter_mm: 20,
+  pocket_style: 'relief',
+  relief_smooth_mm: 2.5,
+  relief_clearance_mm: 1.0,
+  relief_resolution_mm: 1.0,
+  relief_clean_solids: true,
+  relief_semantic: true,
+  cnc_cutter_mm: 6,
+  cnc_stepover_mm: 2,
+  cnc_stepdown_mm: 6,
+  cnc_feed_mm_min: 1500,
+  cnc_plunge_mm_min: 500,
+  cnc_safe_z_mm: 5,
+  cnc_spindle_rpm: 12000,
 };
 
 export const TOOL_COLORS = [

@@ -73,7 +73,7 @@ export async function createCapture(file: File, opts: { marker_size_mm: number; 
   return resp.json();
 }
 
-export const MARKER_SHEET_URL = `${API_BASE_URL}/api/marker_sheet.svg?marker_mm=50`;
+export const MARKER_SHEET_URL = `${API_BASE_URL}/api/marker_sheet.svg?marker_mm=25`;   // must match the app's AppSettings.markerSizeMm (25 since 2026-10-02)
 
 export function imageUrl(sessionId: string, stage: 'original' | 'rectified' | 'height' | 'height_original', version: number) {
   return `${API_BASE_URL}/api/sessions/${sessionId}/image/${stage}?v=${version}`;
@@ -88,7 +88,7 @@ export function calibrate(sessionId: string, corners: number[][], width_mm?: num
 }
 
 export interface AutoDetectOptions {
-  mode: 'auto' | 'color' | 'height';
+  mode: 'auto' | 'color' | 'height' | 'hybrid';
   min_area_mm2: number;
   height_threshold_mm: number;
   refine_with_sam: boolean;
@@ -146,8 +146,47 @@ export function buildLayoutBody(
         rotation_deg: t.rotation_deg,
         offset_mm: t.offset_mm,
         notch: t.notch,
+        pocket_style: t.pocket_style ?? s.pocket_style,
+        depth_override_mm: t.depth_mm,          // relief pockets honour only an explicit per-tool depth, not the rule
+        source: t.source,                       // drawn shapes are processed EXACTLY (no smoothing / straightening)
+        shape: t.shape ? { kind: t.shape.kind } : undefined,
       })),
+    relief: {
+      default_style: s.pocket_style, resolution_mm: s.relief_resolution_mm, smooth_mm: s.relief_smooth_mm, z_clearance_mm: s.relief_clearance_mm,
+      clean_solids: s.relief_clean_solids, semantic: s.relief_semantic,
+      mat_thickness_mm: s.mat_thickness_mm, cutter_mm: s.cnc_cutter_mm, stepover_mm: s.cnc_stepover_mm, stepdown_mm: s.cnc_stepdown_mm,
+      feed_mm_min: s.cnc_feed_mm_min, plunge_mm_min: s.cnc_plunge_mm_min, safe_z_mm: s.cnc_safe_z_mm, spindle_rpm: s.cnc_spindle_rpm,
+    },
   };
+}
+
+export type ReliefFormat = 'stl' | 'png' | 'gcode' | 'package';
+export interface ReliefGrid extends Heightfield { thickness_mm: number; max_depth_mm: number; tools: { id: string; style: string; max_depth_mm: number; min_depth_mm: number; solid?: string; solid_residual_mm?: number; clean_steps?: string[] }[] }
+/** The carved foam top surface for the 3D preview (z <= 0 relative to the foam top) plus per-tool depths. */
+export async function getReliefGrid(body: ReturnType<typeof buildLayoutBody>, resolutionMm = 2): Promise<ReliefGrid> {
+  const resp = await fetch(`${API_BASE_URL}/api/relief`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, format: 'grid', relief: { ...body.relief, resolution_mm: resolutionMm } }),
+  });
+  if (!resp.ok) throw new Error(await parseError(resp, 'Relief preview failed'));
+  const raw = (await resp.json()) as Record<string, unknown>;
+  const hf = decodeHeightfield(raw);
+  // no `valid` mask: with one, heightfieldGeometry drops triangles and goes non-indexed, which gives FLAT shading —
+  // every grid cell its own facet, the "quantized" look. The carved block is one continuous indexed surface.
+  hf.valid = undefined;
+  return { ...hf, thickness_mm: raw.thickness_mm as number, max_depth_mm: raw.max_depth_mm as number, tools: raw.tools as ReliefGrid['tools'] };
+}
+/** Download the form-fit block: STL (carved mesh), PNG (16-bit depth map + JSON, zipped) or G-code (GRBL raster finishing). */
+export async function exportRelief(body: ReturnType<typeof buildLayoutBody>, format: ReliefFormat, exportOpts: Record<string, unknown>): Promise<{ blob: Blob; filename: string; stats?: Record<string, number> }> {
+  const resp = await fetch(`${API_BASE_URL}/api/relief`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, format, export: exportOpts }),
+  });
+  if (!resp.ok) throw new Error(await parseError(resp, 'Relief export failed'));
+  const cd = resp.headers.get('Content-Disposition') || '';
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+  const statsRaw = resp.headers.get('X-Gcode-Stats');
+  return { blob: await resp.blob(), filename: m ? decodeURIComponent(m[1]) : `relief.${format}`, stats: statsRaw ? JSON.parse(statsRaw) : undefined };
 }
 
 export function computeLayout(body: ReturnType<typeof buildLayoutBody>) {
@@ -255,6 +294,67 @@ export async function snapToBase(sessionId: string, polygon_px: number[][], opts
   });
   if (!resp.ok) throw new Error(await parseError(resp, 'Could not snap to the base'));
   return ((await resp.json()) as { polygon_px: number[][] }).polygon_px;
+}
+
+// ------------------------------------------------------------------ knowledge-driven cleanup
+
+export interface CleanupEdit { from_mark: number; to_mark: number; kind: string; note: string }
+export interface CleanupRecognition {
+  tool_name: string; description: string; shape_class: string; symmetric_axis: 'long' | 'short' | 'none';
+  straight_edges: boolean; right_angles: boolean; round_shaft: boolean; trace_quality: 'good' | 'minor_issues' | 'poor';
+  edits: CleanupEdit[]; confidence: number; notes: string; model: string;
+}
+export interface CleanupVerification { follows_edge: boolean; issues: CleanupEdit[]; better_than_orange: boolean; notes: string; second_round?: boolean }
+export interface CleanupStep { type: string; [k: string]: unknown }
+export interface CleanupProposal {
+  id: string; name?: string | null; error?: string;
+  recognition: CleanupRecognition | null; verification: CleanupVerification | null; hints: Record<string, unknown>;
+  /** the proposal (green) over the photo crop, measured trace faded, numbered marks — base64 PNG */
+  preview_png?: string; n_marks?: number;
+  polygon_px: number[][]; polygon_mm: number[][];
+  applied: CleanupStep[]; refused: CleanupStep[];
+  max_move_mm: number; area_before_mm2: number; area_after_mm2: number; area_change_pct: number;
+}
+/** Ask for cleaned-up outlines. With credentials on the server the model inspects each tool's photo + height crops
+ *  (full resolution, numbered marks around the trace), says what it is and where the trace is wrong, the geometry
+ *  applies what the data supports, and the model checks the result. Proposals only — commit on Accept. */
+export function cleanupOutlines(sessionId: string, tools: { id: string; polygon_px: number[][]; name?: string }[], recognize = true) {
+  return postJson<{ proposals: CleanupProposal[]; recognition_available: boolean; recognition_reason: string | null }>(
+    `/api/sessions/${sessionId}/cleanup`, { tools, recognize }, 'Clean up failed');
+}
+
+// ------------------------------------------------------------------ drawer agent
+
+export interface AgentLogEntry { step: number; tool: string; input?: Record<string, unknown>; summary: string; error?: boolean; t: number }
+export interface AgentToolResult extends ToolResult { name?: string; status?: string; changed?: boolean; new?: boolean; preview_png?: string; edited?: boolean }
+export interface AgentResult {
+  tools: AgentToolResult[]; removed: string[]; changed: string[]; summary: string; stopped: string; calls: number; seconds: number;
+  usage: { input_tokens: number; output_tokens: number }; log: AgentLogEntry[];
+}
+export interface AgentLiveTool { id: string; name: string | null; status: string | null; polygon_mm: number[][]; area_mm2: number | null; changed: boolean; new: boolean }
+export interface AgentLive { tools: AgentLiveTool[]; removed: string[]; changed: string[] }
+export interface AgentJob { id: string; status: 'running' | 'done' | 'error'; error: string | null; log: AgentLogEntry[]; log_total: number; seconds: number; result?: AgentResult; live?: AgentLive;
+  dismissed?: boolean; started?: number; summary?: string | null; changed?: number; removed?: number }
+export interface AgentJobSummary { id: string; session: string; status: 'running' | 'done' | 'error'; error: string | null; started: number; seconds: number; dismissed: boolean; log_total: number; summary: string | null; changed: number; removed: number }
+/** This drawer's agent runs, newest first — a running one is resumed, a finished undismissed one is shown again. */
+export async function listAgentJobs(sessionId: string): Promise<AgentJobSummary[]> {
+  const resp = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/agent`);
+  if (!resp.ok) throw new Error(await parseError(resp, 'Could not list agent runs'));
+  return ((await resp.json()) as { jobs: AgentJobSummary[] }).jobs;
+}
+export function dismissAgentJob(jobId: string) {
+  return postJson<{ ok: boolean }>(`/api/agent/${jobId}/dismiss`, {}, 'Could not dismiss the agent run');
+}
+
+/** Start the drawer agent on this scan's tools: the model looks, splits/merges/re-detects/edits, checks, and returns a
+ *  proposal for the whole tool list. Poll `getAgentJob` for the live log. */
+export function startAgent(sessionId: string, tools: { id: string; name: string; polygon_px: number[][] }[], instructions = '') {
+  return postJson<{ job_id: string }>(`/api/sessions/${sessionId}/agent`, { tools, instructions }, 'Could not start the agent');
+}
+export async function getAgentJob(jobId: string, since = 0): Promise<AgentJob> {
+  const resp = await fetch(`${API_BASE_URL}/api/agent/${jobId}?since=${since}`);
+  if (!resp.ok) throw new Error(await parseError(resp, 'Agent status failed'));
+  return (await resp.json()) as AgentJob;
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {

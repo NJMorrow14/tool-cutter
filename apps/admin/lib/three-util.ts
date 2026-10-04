@@ -97,7 +97,7 @@ export function makeScene(host: HTMLElement) {
   renderer.domElement.style.display = "block";
   host.appendChild(renderer.domElement);
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xe5e7eb);
+  scene.background = new THREE.Color(0x20242b);
   const camera = new THREE.PerspectiveCamera(40, 1, 1, 10000);
   scene.add(new THREE.HemisphereLight(0xffffff, 0x6b7280, 1.0));
   const dir = new THREE.DirectionalLight(0xffffff, 1.6);

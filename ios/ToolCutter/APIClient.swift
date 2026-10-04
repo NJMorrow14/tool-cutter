@@ -7,9 +7,10 @@ struct CaptureIntrinsics: Codable {
 }
 
 struct DepthPayload {
-    var data: Data          // float32 little-endian, row-major, meters
+    var data: Data          // row-major; float32 LE metres ("f32", default) or uint16 millimetres ("u2mm")
     var width: Int
     var height: Int
+    var dtype: String = "f32"
 }
 
 struct SessionInfo: Decodable {
@@ -99,6 +100,7 @@ struct APIClient {
                 entry["depth"] = dn
                 entry["depth_width"] = d.width
                 entry["depth_height"] = d.height
+                entry["depth_dtype"] = d.dtype          // "f32" (metres) or "u2mm" (uint16 millimetres)
                 file(dn, filename: dn, type: "application/octet-stream", data: d.data)
             }
             manifest.append(entry)
@@ -118,6 +120,30 @@ struct APIClient {
     }
 
     /// LiDAR fusion of an arc of frames: returns the finished session right away.
+    struct MarkerCheck: Decodable { let ids: [Int]; let count: Int; let adjacent_pair: Bool; let ok: Bool }
+
+    /// Which corner markers the server sees in one small frame. Used before a sweep starts: the drawer can only be
+    /// measured exactly from a view with 3+ markers, and every failed scan so far began without one.
+    func markers(jpeg: Data) async throws -> MarkerCheck {
+        var req = URLRequest(url: base.appendingPathComponent("api/markers"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8
+        let boundary = "ToolCutter-\(UUID().uuidString)"
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image\"; filename=\"preview.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
+        body.append(jpeg)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        let (data, resp): (Data, URLResponse)
+        do { (data, resp) = try await URLSession.shared.upload(for: req, from: body) }
+        catch { throw APIError.transport("Could not reach the ToolCutter server: \(error.localizedDescription)") }
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let msg = obj["error"] as? String { throw APIError.server(msg) }
+            throw APIError.server("Server returned HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        return try JSONDecoder().decode(MarkerCheck.self, from: data)
+    }
+
     func uploadLidarArc(frames: [SweepFrame], markerSizeMm: Double, insetMm: Double, drawerSize: (Double, Double)?) async throws -> SessionInfo {
         if frames.contains(where: { $0.sensor == "truedepth" }) {
             var check = URLRequest(url: base.appendingPathComponent("health"))
