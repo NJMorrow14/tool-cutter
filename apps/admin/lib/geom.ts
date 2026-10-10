@@ -114,6 +114,7 @@ export function toolFromResult(r: ToolResult, index: number, source: SourceKind,
     polygon_mm: r.polygon_mm,
     area_mm2: r.area_mm2,
     measured_thickness_mm: r.measured_thickness_mm,
+    depth_coverage: r.depth_coverage ?? null,
     image_url: r.image_url,
     image_source: r.image_source,
     include: true,
@@ -266,6 +267,17 @@ export function ringBounds(poly: number[][]): number[] {
 // ------------------------------------------------------------------ drawn primitives
 
 /** Outline (mm, y down, bbox at the origin) of a simple shape. */
+/** Segments for an arc of `r` mm spanning `sweep` radians so that the chord error (sagitta) stays under SHAPE_SAGITTA_MM —
+ *  a 60 mm circle is 32 points, not 188. Nolan (2026-10-03): "Circles and squares are turned into shapes with hundreds of
+ *  vertices which makes them difficult to resize." The cutter does not need sub-0.2 mm chords and the handles must stay
+ *  grabbable. */
+const SHAPE_SAGITTA_MM = 0.15;
+function arcSegments(r: number, sweep: number): number {
+  if (r <= SHAPE_SAGITTA_MM) return 1;
+  const per = 2 * Math.acos(Math.max(-1, Math.min(1, 1 - SHAPE_SAGITTA_MM / r)));   // angle per segment at that sagitta
+  return Math.max(2, Math.min(64, Math.ceil(sweep / per)));
+}
+
 export function shapePolygon(spec: ShapeSpec): number[][] {
   if (spec.kind === 'poly') return spec.points && spec.points.length >= 3 ? spec.points : [[0, 0], [spec.w_mm, 0], [spec.w_mm, spec.h_mm], [0, spec.h_mm]];
   const w = Math.max(1, spec.w_mm), h = Math.max(1, spec.h_mm);
@@ -274,7 +286,7 @@ export function shapePolygon(spec: ShapeSpec): number[][] {
     for (let i = 0; i <= n; i++) { const a = a0 + ((a1 - a0) * i) / n; pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); }
   };
   if (spec.kind === 'circle') {
-    const r = w / 2, n = Math.max(48, Math.round(Math.PI * w / 1.0));
+    const r = w / 2, n = Math.max(16, arcSegments(r, 2 * Math.PI));
     for (let i = 0; i < n; i++) { const a = (2 * Math.PI * i) / n; pts.push([r + r * Math.cos(a), r + r * Math.sin(a)]); }
     return pts;
   }
@@ -286,12 +298,46 @@ export function shapePolygon(spec: ShapeSpec): number[][] {
   }
   const r = spec.kind === 'slot' ? Math.min(w, h) / 2 : Math.min(Math.max(0, spec.r_mm), w / 2, h / 2);
   if (r <= 0.05) return [[0, 0], [w, 0], [w, h], [0, h]];
-  const n = Math.max(6, Math.round((Math.PI / 2) * r / 1.0));
+  const n = Math.max(3, arcSegments(r, Math.PI / 2));
   arc(w - r, r, r, -Math.PI / 2, 0, n);
   arc(w - r, h - r, r, 0, Math.PI / 2, n);
   arc(r, h - r, r, Math.PI / 2, Math.PI, n);
   arc(r, r, r, Math.PI, 1.5 * Math.PI, n);
   return pts;
+}
+
+/** Resize a parametric shape from a handle drag instead of baking it into a free polygon: the vertex that moved most
+ *  sets the new size about the shape's centre. Circle: the new diameter is twice the dragged point's distance from the
+ *  centre; hex: flat-to-flat from the corner radius; rect/slot: a point on a vertical edge sets the width, on a horizontal
+ *  edge the height, a corner sets both. `localBefore`/`localAfter` are in the shape's own frame (shapePolygon coordinates).
+ *  Returns the new spec and the shift of the shape's centre (so the caller can keep it in place), or null for 'poly'. */
+function boundsOf(pts: number[][]) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of pts) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  return { minX, minY, maxX, maxY };
+}
+
+export function resizeShapeFromDrag(spec: ShapeSpec, localBefore: number[][], localAfter: number[][]): { spec: ShapeSpec; centreShift: { x: number; y: number } } | null {
+  if (spec.kind === 'poly' || localBefore.length !== localAfter.length || localBefore.length < 3) return null;
+  let k = 0, best = -1;
+  for (let i = 0; i < localBefore.length; i++) { const d = Math.hypot(localAfter[i][0] - localBefore[i][0], localAfter[i][1] - localBefore[i][1]); if (d > best) { best = d; k = i; } }
+  if (best < 0.05) return null;
+  const bb = boundsOf(localBefore); const cx = (bb.minX + bb.maxX) / 2, cy = (bb.minY + bb.maxY) / 2;
+  const w0 = bb.maxX - bb.minX, h0 = bb.maxY - bb.minY;
+  const p = localAfter[k], q = localBefore[k];
+  const round = (v: number) => Math.max(2, Math.round(v * 2) / 2);
+  const next: ShapeSpec = { ...spec };
+  if (spec.kind === 'circle') { next.w_mm = next.h_mm = round(2 * Math.hypot(p[0] - cx, p[1] - cy)); }
+  else if (spec.kind === 'hex') { const R = Math.hypot(p[0] - cx, p[1] - cy); next.w_mm = round(R * Math.sqrt(3)); next.h_mm = round(2 * R); }
+  else {
+    const onV = Math.abs(q[0] - cx) >= 0.45 * w0, onH = Math.abs(q[1] - cy) >= 0.45 * h0;
+    if (onV || !onH) next.w_mm = round(2 * Math.abs(p[0] - cx));
+    if (onH || !onV) next.h_mm = round(2 * Math.abs(p[1] - cy));
+    if (spec.kind === 'slot') next.w_mm = Math.max(next.w_mm, next.h_mm) === next.w_mm ? next.w_mm : next.w_mm;   // a slot's ends follow its short side automatically
+    if (spec.kind === 'rect') next.r_mm = Math.min(spec.r_mm, next.w_mm / 2, next.h_mm / 2);
+  }
+  const nb = boundsOf(shapePolygon(next));
+  return { spec: next, centreShift: { x: (nb.minX + nb.maxX) / 2 - cx, y: (nb.minY + nb.maxY) / 2 - cy } };
 }
 
 export function shapeName(spec: ShapeSpec): string {

@@ -5,12 +5,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import ui from './ui.module.css';
 import ed from './editor.module.css';
-import { getToolHeightfield, resolveDepth, type Heightfield } from '../lib/api';
+import { getToolHeightfield, resolveDepth, type Heightfield, type ReliefGrid } from '../lib/api';
 import { polygonCentroid } from '../lib/geom';
 import { disposeObject, frameBox, heightfieldGeometry, makeScene, polygonShape, ringsShape } from '../lib/three-util';
 import type { LayoutResponse, LayoutSettings, Tool } from '../lib/types';
 
 interface Props {
+  historyRevision?: number;
   tools: Tool[];
   layout: LayoutResponse | null;
   mat: { width_mm: number; height_mm: number };
@@ -23,13 +24,15 @@ interface Props {
   pickedIds?: string[];
   /** Cmd/Ctrl/Shift-click on a tool body: add it to / remove it from the ticked set instead of grabbing it */
   onPick?: (id: string) => void;
+  /** form-fit pockets: the carved top surface (z <= 0) replaces the flat block top and the flat pocket floors */
+  reliefGrid?: ReliefGrid | null;
 }
 
 type ToolNode = { group: THREE.Group; body: THREE.Mesh; key: string };
 
 /** The foam block with the scanned tool bodies sitting in their pockets. Drag a tool to move it on the mat;
  *  the same keyboard nudges/rotation as the 2D sheet apply. Pockets come from the computed layout. */
-export default function Layout3D({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick }: Props) {
+export default function Layout3D({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick, historyRevision = 0, reliefGrid = null }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [showTools, setShowTools] = useState(true);
@@ -38,8 +41,9 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
     foam: THREE.Mesh | null; pockets: THREE.Group; toolsGroup: THREE.Group; nodes: Map<string, ToolNode>; hfs: Map<string, Heightfield | null>;
     drag: { id: string; start: THREE.Vector3; delta: THREE.Vector3; moved: boolean } | null;
   } | null>(null);
-  const propsRef = useRef({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick });
-  propsRef.current = { tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick };
+  useEffect(() => { if (S.current) { S.current.drag = null; S.current.controls.enabled = true; } }, [historyRevision]);
+  const propsRef = useRef({ tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick, reliefGrid });
+  propsRef.current = { tools, layout, mat, settings, selectedId, onSelect, onMove, pickedIds, onPick, reliefGrid };
 
   // ------------------------------------------------------------------ scene
   useEffect(() => {
@@ -152,15 +156,39 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
     if (!s) return;
     if (s.foam) { s.root.remove(s.foam); disposeObject(s.foam); }
     const T = settings.mat_thickness_mm;
-    const geom = new THREE.BoxGeometry(mat.width_mm, mat.height_mm, T);
-    const foam = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color: 0x3b4252, roughness: 0.95 }));
-    foam.position.set(mat.width_mm / 2, mat.height_mm / 2, -T / 2);
+    const foamMat = new THREE.MeshStandardMaterial({ color: 0x3b4252, roughness: 0.95 });
+    let foam: THREE.Mesh;
+    if (reliefGrid) {
+      // the carved block: the depth map as the top surface (its steep cells ARE the pocket walls), a slab underneath,
+      // and four outer walls from the slab up to the top edge
+      const group = new THREE.Group();
+      const surf = new THREE.Mesh(heightfieldGeometry(reliefGrid, 1, 0), new THREE.MeshStandardMaterial({ color: 0x3b4252, roughness: 0.95, side: THREE.DoubleSide }));
+      group.add(surf);
+      const slabTop = -Math.min(T - 0.5, reliefGrid.max_depth_mm + 0.3);
+      const slab = new THREE.Mesh(new THREE.BoxGeometry(mat.width_mm, mat.height_mm, T + slabTop), foamMat);
+      slab.position.set(mat.width_mm / 2, mat.height_mm / 2, (-T + slabTop) / 2);
+      group.add(slab);
+      const wallH = -slabTop;
+      const walls: [number, number, number, number, number][] = [
+        [mat.width_mm / 2, 0, 0, mat.width_mm, 0], [mat.width_mm / 2, mat.height_mm, Math.PI, mat.width_mm, 0],
+        [0, mat.height_mm / 2, Math.PI / 2, mat.height_mm, 0], [mat.width_mm, mat.height_mm / 2, -Math.PI / 2, mat.height_mm, 0],
+      ];
+      for (const [x, y, rz, len] of walls) {
+        const w = new THREE.Mesh(new THREE.PlaneGeometry(len, wallH), new THREE.MeshStandardMaterial({ color: 0x3b4252, roughness: 0.95, side: THREE.DoubleSide }));
+        w.rotation.set(Math.PI / 2, 0, rz); w.position.set(x, y, slabTop + wallH / 2);
+        group.add(w);
+      }
+      foam = group as unknown as THREE.Mesh;
+    } else {
+      foam = new THREE.Mesh(new THREE.BoxGeometry(mat.width_mm, mat.height_mm, T), foamMat);
+      foam.position.set(mat.width_mm / 2, mat.height_mm / 2, -T / 2);
+    }
     s.root.add(foam);
     s.foam = foam;
     s.root.updateMatrixWorld(true);
     const center = s.root.localToWorld(new THREE.Vector3(mat.width_mm / 2, mat.height_mm / 2, 0));
     if (!s.camera.userData.framed) { frameBox(s.camera, center, mat.width_mm, mat.height_mm, s.controls.target); s.camera.userData.framed = true; }
-  }, [mat.width_mm, mat.height_mm, settings.mat_thickness_mm]);
+  }, [mat.width_mm, mat.height_mm, settings.mat_thickness_mm, reliefGrid]);
 
   // ------------------------------------------------------------------ pockets (from the computed layout)
   useEffect(() => {
@@ -175,6 +203,11 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
       const depth = lt.depth_mm === null || lt.depth_mm >= T - 0.25 ? T : Math.min(Math.max(lt.depth_mm, 0.5), T - 2);
       const through = depth >= T;
       const bad = lt.outside_mat || lt.overlaps.length > 0;
+      if (propsRef.current.reliefGrid) {
+        const edges = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(lt.rings[0].map(([x, y]) => new THREE.Vector3(x, y, 0.3))), new THREE.LineBasicMaterial({ color: bad ? 0xdc2626 : 0x9ca3af }));
+        s.pockets.add(edges);
+        continue;
+      }
       // pocket = a hole: draw the pocket floor at -depth and dark walls as an extrusion with the shape's inside
       const floorGeom = new THREE.ShapeGeometry(shape);
       const floor = new THREE.Mesh(floorGeom, new THREE.MeshStandardMaterial({ color: bad ? 0xdc2626 : through ? 0xf26a1b : 0x1b1f22, roughness: 0.95, side: THREE.DoubleSide }));
@@ -192,7 +225,7 @@ export default function Layout3D({ tools, layout, mat, settings, selectedId, onS
         s.pockets.add(ring);
       }
     }
-  }, [layout, settings.mat_thickness_mm]);
+  }, [layout, settings.mat_thickness_mm, reliefGrid]);
 
   // ------------------------------------------------------------------ tool bodies
   const buildBody = async (t: Tool, s: NonNullable<typeof S.current>): Promise<THREE.Mesh> => {

@@ -78,3 +78,5 @@ backend/captures/
 
 # generated analysis output (regenerate with tests/*_eval.py)
 /output/
+# drawer-agent run records (proposals, logs)
+backend/agent_jobs/

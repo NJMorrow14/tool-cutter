@@ -18,10 +18,10 @@ struct HomeView: View {
                         Label("Scan a drawer", systemImage: "camera.viewfinder").font(.headline)
                     }
                     Link(destination: settings.markerSheetURL) {
-                        Label("Print the corner marker sheet", systemImage: "printer")
+                        Label("Print the corner marker sheet (\(settings.markerSizeMm.formatted()) mm)", systemImage: "printer")
                     }
                 } footer: {
-                    Text("Put the four printed markers in the drawer corners, lay the tools out, then glide the phone along the drawer about 50 cm up. Outlines, heights and the drawer size come out to scale; review, arrange and export on the next screen.")
+                    Text("Put the four printed markers in the drawer corners and lay the tools out. Lift the phone until it sees 3+ markers and press Start: it takes an overview photo, then you turn it screen-down and glide the drawer 20–50 cm up while it ticks. Outlines, heights and the drawer size come out to scale; review, arrange and export on the next screen.")
                 }
 
                 Section("Drawers") {

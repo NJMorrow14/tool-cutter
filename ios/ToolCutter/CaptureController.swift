@@ -16,6 +16,17 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
     private var smoothedTilt = simd_float2(0, 0)
     @Published var trackingOK = false
     @Published var hasDepth = false
+    /// Height of the camera above what it is looking at, from the LiDAR depth at the image centre (metres -> mm,
+    /// smoothed). With the phone near level this IS the scan height, and the scan height is the one thing that
+    /// decided both of Nolan's first two rear scans: 42 cm registered well but the 256x144 LiDAR could not see a
+    /// 3 mm rule (~2 mm/px); 18 cm saw the rule but ARKit drifted 30 mm over featureless liner and no frame held
+    /// two markers. ~30 cm is the band where both hold.
+    @Published var cameraHeightMm: Double = 0
+    private var smoothedHeight: Double = 0
+    /// Every ARKit frame (<= 10 Hz) while recording, for the live preview map — the recorder's own timer only
+    /// takes a frame every 0.5 s, which made the map fill in as slow, coarse blocks.
+    var onFrame: ((ARFrame) -> Void)?
+    private var lastPreviewAt: TimeInterval = 0
     @Published var statusText = "Starting camera…"
     @Published var isCapturing = false
     private(set) var lastFrame: ARFrame?
@@ -53,16 +64,49 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
         let shown = smoothedTilt
         let ok: Bool
         if case .normal = frame.camera.trackingState { ok = true } else { ok = false }
+        var centreM: Double = 0
+        if let d = frame.sceneDepth?.depthMap, CVPixelBufferGetPixelFormatType(d) == kCVPixelFormatType_DepthFloat32 {
+            CVPixelBufferLockBaseAddress(d, .readOnly)
+            if let base = CVPixelBufferGetBaseAddress(d) {
+                let w = CVPixelBufferGetWidth(d), h = CVPixelBufferGetHeight(d), rb = CVPixelBufferGetBytesPerRow(d)
+                // median of a 5x5 patch at the centre: one bad return must not swing the readout
+                var vals: [Float] = []
+                for dy in -2...2 { for dx in -2...2 {
+                    let v = base.advanced(by: (h / 2 + dy) * rb).assumingMemoryBound(to: Float.self)[w / 2 + dx]
+                    if v.isFinite && v > 0.05 { vals.append(v) }
+                } }
+                if vals.count >= 8 { vals.sort(); centreM = Double(vals[vals.count / 2]) }
+            }
+            CVPixelBufferUnlockBaseAddress(d, .readOnly)
+        }
+        if centreM > 0 { smoothedHeight = smoothedHeight == 0 ? centreM : smoothedHeight + (centreM - smoothedHeight) * 0.25 }
+        let heightMm = smoothedHeight * 1000
+        if let sink = onFrame, frame.timestamp - lastPreviewAt >= 0.1 {
+            lastPreviewAt = frame.timestamp
+            sink(frame)
+        }
         DispatchQueue.main.async {
             self.tiltDegrees = Double(simd_length(shown))
             self.tiltOffset = CGSize(width: Double(shown.x), height: Double(shown.y))
             self.trackingOK = ok
             self.hasDepth = frame.sceneDepth != nil
+            self.cameraHeightMm = heightMm
         }
     }
 
     /// One sharp still for the photo pass: full-resolution frame, no depth, marked colour-only.
     /// Taken on demand so the phone is held still, which is what the continuous glide could not guarantee.
+    /// A small JPEG of the live frame (~1200 px wide) for the marker preflight. ArUco needs a marker ~20 px across;
+    /// a 25 mm marker at 60 cm is ~43 px at this size, and the round trip stays well under 200 ms.
+    func previewJPEG() -> Data? {
+        guard let frame = lastFrame else { return nil }
+        let ci = CIImage(cvPixelBuffer: frame.capturedImage)
+        let scale = min(1.0, 1200.0 / ci.extent.width)     // 25 mm markers at 60 cm are ~43 px here; ArUco wants >= 20
+        let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        return ciContext.jpegRepresentation(of: small, colorSpace: CGColorSpaceCreateDeviceRGB(),
+                                            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.8])
+    }
+
     func stillFrame() async throws -> SweepFrame {
         let c = try await capture(preferHighResolution: true)
         return SweepFrame(jpeg: c.jpeg, depth: nil, intrinsics: c.intrinsics, gravity: nil,

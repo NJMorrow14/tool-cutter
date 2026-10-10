@@ -14,7 +14,12 @@ final class AppSettings: ObservableObject {
         serverHost = d.string(forKey: "serverHost") ?? "192.168.1.193"
         apiPort = d.object(forKey: "apiPort") as? Int ?? 8000
         webPort = d.object(forKey: "webPort") as? Int ?? 3000
-        markerSizeMm = d.object(forKey: "markerSizeMm") as? Double ?? 50
+        // 2026-10-02: markers went 50 -> 25 mm (a quarter of the area). A 50 stored from before that is the OLD default,
+        // not a choice, so it is migrated once; anything else the user typed is kept.
+        var stored = d.object(forKey: "markerSizeMm") as? Double ?? 25
+        if stored == 50 && !d.bool(forKey: "markerSize25Migrated") { stored = 25 }
+        d.set(true, forKey: "markerSize25Migrated")
+        markerSizeMm = stored
         markerInsetMm = d.object(forKey: "markerInsetMm") as? Double ?? 0
     }
 
@@ -24,7 +29,7 @@ final class AppSettings: ObservableObject {
         URL(string: "http://\(serverHost):\(webPort)/?session=\(sessionId)")!
     }
     var markerSheetURL: URL {
-        URL(string: "http://\(serverHost):\(apiPort)/api/marker_sheet.svg?marker_mm=\(Int(markerSizeMm))")!
+        URL(string: "http://\(serverHost):\(apiPort)/api/marker_sheet.svg?marker_mm=\(String(format: "%g", markerSizeMm))")!   // %g, not Int: 12.5 must not print as 12
     }
 }
 
