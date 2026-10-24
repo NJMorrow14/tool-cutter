@@ -3,6 +3,23 @@ import ARKit
 import CoreImage
 import Combine
 import simd
+import AVFoundation
+
+/// Per-frame lens model the server uses to undistort TrueDepth frames. The rear LiDAR path never fills it (ARKit
+/// frames are already rectilinear), but the wire format keeps the field so old captures still replay.
+struct LensCalibration {
+    var inverseLookup: [Float]
+    var center: [Double]
+    var reference: [Double]
+    init(_ calibration: AVCameraCalibrationData) {
+        inverseLookup = calibration.inverseLensDistortionLookupTable?.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) } ?? []
+        center = [Double(calibration.lensDistortionCenter.x), Double(calibration.lensDistortionCenter.y)]
+        reference = [Double(calibration.intrinsicMatrixReferenceDimensions.width), Double(calibration.intrinsicMatrixReferenceDimensions.height)]
+    }
+    var manifest: [String: Any] {
+        ["inverse_lookup": inverseLookup, "center": center, "reference": reference]
+    }
+}
 
 struct SweepFrame {
     var jpeg: Data
@@ -24,6 +41,10 @@ struct SweepFrame {
 /// Main-thread recorder with one encoder job in flight and an explicit drain on Stop.
 final class SweepRecorder: ObservableObject {
     private(set) var frames: [SweepFrame] = []
+    /// Live top-down coverage/height preview, fed with every recorded LiDAR frame (see LiveMap.swift).
+    let liveMap = LiveHeightMap()
+    @Published var liveImage: CGImage?
+    @Published var liveCells = 0
     private var timer: Timer?
     private let ciContext = CIContext()
     private let queue = DispatchQueue(label: "toolcutter.sweep", qos: .userInitiated)
@@ -37,6 +58,9 @@ final class SweepRecorder: ObservableObject {
         cancel()
         frames.removeAll()
         previous = nil
+        liveMap.reset()
+        liveImage = nil
+        liveCells = 0
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             guard let self, !self.encoding, let frame = session.currentFrame else { return }
             guard self.frames.count < 120 else { self.status = "120 frames captured. Stop and build."; return }
@@ -60,6 +84,7 @@ final class SweepRecorder: ObservableObject {
             let token = self.generation
             self.encoding = true
             self.status = "Capturing · keep a slow, steady glide."
+            self.feedLiveMap(frame: frame)
             self.queue.async {
                 let dp = depth.flatMap { Self.depthPayload($0.depthMap, confidence: $0.confidenceMap) }
                 let jpeg = self.ciContext.jpegRepresentation(of: CIImage(cvPixelBuffer: pixelBuffer), colorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -72,6 +97,29 @@ final class SweepRecorder: ObservableObject {
                     if let f { self.frames.append(f); self.onCount?(self.frames.count) }
                 }
             }
+        }
+    }
+
+    /// Fold one ARKit frame into the live preview map. Called from the recorder's own timer AND from
+    /// `CaptureController.onFrame` at up to 10 Hz, so the map fills in continuously rather than in 0.5 s blocks.
+    /// Must be called on the frame's thread (the depth buffer is read synchronously); the fusion itself is queued.
+    func feedLiveMap(frame: ARFrame) {
+        guard let depth = frame.sceneDepth, let live = Self.depthArray(depth.depthMap) else { return }
+        let k = frame.camera.intrinsics, t = frame.camera.transform
+        let pixelBuffer = frame.capturedImage
+        // depth intrinsics: ARKit reports them for the colour image; the depth map is the same field of view
+        // at a lower resolution, so scale by the size ratio
+        let sx = Float(live.w) / Float(CVPixelBufferGetWidth(pixelBuffer)), sy = Float(live.h) / Float(CVPixelBufferGetHeight(pixelBuffer))
+        let token = generation
+        queue.async {
+            let pts = LiveHeightMap.worldPoints(depth: live.depth, w: live.w, h: live.h,
+                                                fx: k.columns.0.x * sx, fy: k.columns.1.y * sy, cx: k.columns.2.x * sx, cy: k.columns.2.y * sy,
+                                                transform: t, stride: 2)
+            self.liveMap.add(points: pts)
+            let pic = self.liveMap.rgba()
+            let img = pic.flatMap { LiveMapImage.make($0) }
+            let cells = self.liveMap.cellsCovered
+            DispatchQueue.main.async { if self.generation == token { self.liveImage = img; self.liveCells = cells } }
         }
     }
 
@@ -108,6 +156,43 @@ final class SweepRecorder: ObservableObject {
         }
         values.sort()
         return (Double(values.count) / Double(max(1, samples)), values.isEmpty ? 0 : values[values.count / 2])
+    }
+
+    /// Depth map as a plain Float array (metres), for the live map. Must be read on the frame's thread.
+    static func depthArray(_ depth: CVPixelBuffer) -> (depth: [Float], w: Int, h: Int)? {
+        guard CVPixelBufferGetPixelFormatType(depth) == kCVPixelFormatType_DepthFloat32 else { return nil }
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+        let w = CVPixelBufferGetWidth(depth), h = CVPixelBufferGetHeight(depth)
+        guard let base = CVPixelBufferGetBaseAddress(depth) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRow(depth)
+        var out = [Float](repeating: 0, count: w * h)
+        for y in 0..<h {
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float.self)
+            for x in 0..<w { out[y * w + x] = row[x] }
+        }
+        return (out, w, h)
+    }
+
+    /// Depth as uint16 millimetres (0 = no return): half the bytes of float32 and it compresses far better. The
+    /// server reads it when the manifest says `depth_dtype: "u2mm"`. 1 mm quantisation is well under the sensor's
+    /// ~2 mm edge response; the sweep's upload was 138 MB of float32 for one drawer (2026-10-02).
+    static func depthPayloadU16(_ depth: CVPixelBuffer) -> DepthPayload? {
+        guard CVPixelBufferGetPixelFormatType(depth) == kCVPixelFormatType_DepthFloat32 else { return nil }
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+        let w = CVPixelBufferGetWidth(depth), h = CVPixelBufferGetHeight(depth)
+        guard let base = CVPixelBufferGetBaseAddress(depth) else { return nil }
+        let rb = CVPixelBufferGetBytesPerRow(depth)
+        var out = [UInt16](repeating: 0, count: w * h)
+        for y in 0..<h {
+            let row = base.advanced(by: y * rb).assumingMemoryBound(to: Float.self)
+            for x in 0..<w {
+                let v = row[x]
+                out[y * w + x] = (v.isFinite && v > 0 && v < 65.0) ? UInt16((v * 1000).rounded()) : 0
+            }
+        }
+        return DepthPayload(data: out.withUnsafeBytes { Data($0) }, width: w, height: h, dtype: "u2mm")
     }
 
     static func depthPayload(_ depth: CVPixelBuffer, confidence: CVPixelBuffer? = nil) -> DepthPayload? {

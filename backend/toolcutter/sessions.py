@@ -19,6 +19,7 @@ class Session:
     original: np.ndarray                     # BGR
     original_height: Optional[np.ndarray] = None   # float32 mm (scans)
     original_frac: Optional[np.ndarray] = None     # float32 0..1 (scans)
+    original_support: Optional[np.ndarray] = None  # uint8: frames agreeing with the fused height per cell (multi-frame)
     original_mm_per_px: Optional[float] = None     # scans only (metric raster)
     suggested_corners: Optional[list] = None
     scan_meta: Dict = field(default_factory=dict)
@@ -29,6 +30,7 @@ class Session:
     rectified: Optional[np.ndarray] = None
     rect_height: Optional[np.ndarray] = None
     rect_frac: Optional[np.ndarray] = None
+    rect_support: Optional[np.ndarray] = None      # see original_support; None for single captures / meshes
     mm_per_px: Optional[float] = None
     mat_mm: Optional[Tuple[float, float]] = None
     corners: Optional[list] = None

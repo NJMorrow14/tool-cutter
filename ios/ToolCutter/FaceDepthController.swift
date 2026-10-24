@@ -46,6 +46,7 @@ final class FaceDepthController: NSObject, ObservableObject, ARSessionDelegate {
     private var lastDepthTimestamp: Double = -1
     private let context = CIContext()
     private let maxFrames = 240
+    private let FRAME_INTERVAL_HZ = 3.0
 
     static let nearM = 0.12, farM = 0.90
 
@@ -216,16 +217,22 @@ final class FaceDepthController: NSObject, ObservableObject, ARSessionDelegate {
         publish(frames.count >= maxFrames ? "\(maxFrames) frames captured. Stop and build."
                 : pose != nil ? "Tracked · sweep the drawer steadily, overlapping as you go"
                 : "Sweep the drawer steadily — OVERLAP EACH VIEW BY HALF, that is what lines the frames up", true)
-        guard recording, frames.count < maxFrames, stamp - lastTimestamp >= 1.0 / 6.0 else { return }
+        // 3 frames/s: at a hand glide of ~15 cm/s that is a frame every 5 cm with a ~25 cm field of view, i.e.
+        // ~80 % overlap — 6/s gave 118 frames and 262 s of fusion for one drawer, half of them redundant
+        guard recording, frames.count < maxFrames, stamp - lastTimestamp >= 1.0 / FRAME_INTERVAL_HZ else { return }
 
         let w = CVPixelBufferGetWidth(pixelBuffer), h = CVPixelBufferGetHeight(pixelBuffer)
         // ARKit reports intrinsics against camera.imageResolution; scale them if the buffer differs.
         let sx = Double(w) / Double(imageSize.width), sy = Double(h) / Double(imageSize.height)
         let intr = CaptureIntrinsics(fx: Double(k.columns.0.x) * sx, fy: Double(k.columns.1.y) * sy,
                                      cx: Double(k.columns.2.x) * sx, cy: Double(k.columns.2.y) * sy, width: w, height: h)
-        guard let jpeg = context.jpegRepresentation(of: CIImage(cvPixelBuffer: pixelBuffer), colorSpace: CGColorSpaceCreateDeviceRGB(),
-                                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.95]),
-              let payload = SweepRecorder.depthPayload(depthMap) else { return }
+        // Colour at half size: the server rasterises at ~0.19 mm/px, which a 2112 px image of a 400 mm view already
+        // exceeds, and ArUco still has ~120 px across a 50 mm marker. Intrinsics stay full-size — the server
+        // rescales K to the decoded image. JPEG bytes drop ~4x (67 MB -> ~17 MB per sweep).
+        let ci = CIImage(cvPixelBuffer: pixelBuffer).transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
+        guard let jpeg = context.jpegRepresentation(of: ci, colorSpace: CGColorSpaceCreateDeviceRGB(),
+                                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9]),
+              let payload = SweepRecorder.depthPayloadU16(depthMap) else { return }
         // With world tracking off, camera.transform is NOT a world pose (a face config without a face in view
         // reports little more than gravity) — send nothing and let the server match the frame to a neighbour.
         frames.append(SweepFrame(jpeg: jpeg, depth: payload, intrinsics: intr, gravity: nil, transform: pose,
