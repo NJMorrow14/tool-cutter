@@ -8,14 +8,25 @@ final class AppSettings: ObservableObject {
     @Published var webPort: Int { didSet { UserDefaults.standard.set(webPort, forKey: "webPort") } }
     @Published var markerSizeMm: Double { didSet { UserDefaults.standard.set(markerSizeMm, forKey: "markerSizeMm") } }
     @Published var markerInsetMm: Double { didSet { UserDefaults.standard.set(markerInsetMm, forKey: "markerInsetMm") } }
+    /// The tool-library job (customer / toolboard) that "Capture tools" saves into. An id starting "local-" was made
+    /// offline and is created on the server by PendingUploads on the next flush.
+    @Published var currentJobId: String? { didSet { UserDefaults.standard.set(currentJobId, forKey: "currentJobId") } }
+    @Published var currentJobName: String? { didSet { UserDefaults.standard.set(currentJobName, forKey: "currentJobName") } }
 
     init() {
         let d = UserDefaults.standard
         serverHost = d.string(forKey: "serverHost") ?? "192.168.1.193"
         apiPort = d.object(forKey: "apiPort") as? Int ?? 8000
         webPort = d.object(forKey: "webPort") as? Int ?? 3000
-        markerSizeMm = d.object(forKey: "markerSizeMm") as? Double ?? 50
+        // 2026-10-02: markers went 50 -> 25 mm (a quarter of the area). A 50 stored from before that is the OLD default,
+        // not a choice, so it is migrated once; anything else the user typed is kept.
+        var stored = d.object(forKey: "markerSizeMm") as? Double ?? 25
+        if stored == 50 && !d.bool(forKey: "markerSize25Migrated") { stored = 25 }
+        d.set(true, forKey: "markerSize25Migrated")
+        markerSizeMm = stored
         markerInsetMm = d.object(forKey: "markerInsetMm") as? Double ?? 0
+        currentJobId = d.string(forKey: "currentJobId")
+        currentJobName = d.string(forKey: "currentJobName")
     }
 
     var apiBase: URL { URL(string: "http://\(serverHost):\(apiPort)")! }
@@ -23,8 +34,15 @@ final class AppSettings: ObservableObject {
     func reviewURL(sessionId: String) -> URL {
         URL(string: "http://\(serverHost):\(webPort)/?session=\(sessionId)")!
     }
+    /// The admin's Design insert opened on a tool-library job (docs/tool-library.md, "Website").
+    func toolboardURL(jobId: String) -> URL {
+        var c = URLComponents(url: webBase, resolvingAgainstBaseURL: false)!
+        c.path = "/"
+        c.queryItems = [URLQueryItem(name: "job", value: jobId)]
+        return c.url!
+    }
     var markerSheetURL: URL {
-        URL(string: "http://\(serverHost):\(apiPort)/api/marker_sheet.svg?marker_mm=\(Int(markerSizeMm))")!
+        URL(string: "http://\(serverHost):\(apiPort)/api/marker_sheet.svg?marker_mm=\(String(format: "%g", markerSizeMm))")!   // %g, not Int: 12.5 must not print as 12
     }
 }
 

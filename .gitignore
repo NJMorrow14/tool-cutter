@@ -78,3 +78,10 @@ backend/captures/
 
 # generated analysis output (regenerate with tests/*_eval.py)
 /output/
+# drawer-agent run records (proposals, logs)
+backend/agent_jobs/
+
+# Core ML models are fetched by ios/scripts/fetch_sam2_models.sh
+ios/ToolCutter/Models/*.mlpackage
+# Tool library (phone captures of single tools)
+backend/library/

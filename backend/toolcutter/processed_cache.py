@@ -13,7 +13,7 @@ from .sessions import Session
 
 log = logging.getLogger(__name__)
 # Bump when reconstruction semantics change; detection has its own version.
-RECONSTRUCTION_VERSION = 5
+RECONSTRUCTION_VERSION = 6   # 6: rect_support raster (frame agreement) added to the fusion
 DETECTION_VERSION = 2
 TRANSIENT = {'masks', 'photo_discovery_cache', 'tool_view_cache', 'tool_image_frames',
              'photo_result_cache', 'detection_lock'}
