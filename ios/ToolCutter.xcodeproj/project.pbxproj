@@ -14,16 +14,30 @@
 		84496BCD39F3EB38D0D503F8 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3E1576A4683F425C7C0C18A /* HomeView.swift */; };
 		936AF0E6FCFC2F318B58B48A /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D530675BA00DBBF983E22BB6 /* APIClient.swift */; };
 		A98CF80AA86EBCE178E9FD08 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03A8D51AC6A75082F5A88001 /* AppSettings.swift */; };
-		2B3C4D5E6F70819A2B3C4D5F /* FaceDepthController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B3C4D5E6F70819A2B3C4D5E /* FaceDepthController.swift */; };
+		F5A6B7C8D9E0F1A2B3C4D5E6 /* FaceDepthController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6B7C8D9E0F1A2B3C4D5E6F7 /* FaceDepthController.swift */; };
+		D3E4F5A6B7C8D9E0F1A2B3C4 /* LiveMapView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4F5A6B7C8D9E0F1A2B3C4D5 /* LiveMapView.swift */; };
+		B1C2D3E4F5A6B7C8D9E0F1A2 /* LiveMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2D3E4F5A6B7C8D9E0F1A2B3 /* LiveMap.swift */; };
 		1A2B3C4D5E6F70819A2B3C4E /* LevelMath.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2B3C4D5E6F70819A2B3C4D /* LevelMath.swift */; };
 		D0C2FA26F47CF53C48E8A744 /* SweepRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27B137FCD656B222282F41D6 /* SweepRecorder.swift */; };
-		B09EE13242A74946A920AA01 /* TrueDepthController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B09EE13242A74946A920AA02 /* TrueDepthController.swift */; };
 		C09EE13242A74946A920AA01 /* CaptureTiming.swift in Sources */ = {isa = PBXBuildFile; fileRef = C09EE13242A74946A920AA02 /* CaptureTiming.swift */; };
+		146644B840EDB93E417B96B6 /* OutlineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = D09EDBFC7EDFB15B68BE0BD1 /* OutlineEngine.swift */; };
+		2527C6D30F810DD824676799 /* SAM2Engine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84B77888AB2D249C2C4DE1A9 /* SAM2Engine.swift */; };
+		341796F1A9EDF2110E7441B1 /* OutlineCorrection.swift in Sources */ = {isa = PBXBuildFile; fileRef = B352B439915B3BE669310C7F /* OutlineCorrection.swift */; };
+		A1C5A99F0201AEF3055318A5 /* PendingUploads.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07FFD6891809E713D12DBB80 /* PendingUploads.swift */; };
+		E5DE6375EB4884B802771D11 /* ToolCaptureModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A42E96404E47EA3A8098787 /* ToolCaptureModel.swift */; };
+		B325DBF459A3F8539FF130C4 /* OutlineEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32011A517E701B28D4714865 /* OutlineEditorView.swift */; };
+		14049E22CCCBBE1F3FC575CC /* JobPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBDA58F1AAB441A486F343F3 /* JobPickerView.swift */; };
+		C94CAB5E7A0EDE89035FC66D /* ToolCaptureView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8152F46D53DD9072D0C35CED /* ToolCaptureView.swift */; };
+		D34C3FB96F143254BB96035F /* SAM2_1SmallImageEncoderFLOAT16.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = FC8285B310B1C76C762049F4 /* SAM2_1SmallImageEncoderFLOAT16.mlpackage */; };
+		188BA5E9D1F0E4A080185E84 /* SAM2_1SmallPromptEncoderFLOAT16.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 60F41DEFD5B166ACF8D7543F /* SAM2_1SmallPromptEncoderFLOAT16.mlpackage */; };
+		5B0DDFEB114FE5DDB2D72B84 /* SAM2_1SmallMaskDecoderFLOAT16.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = CBE988A242673B9F67147EEA /* SAM2_1SmallMaskDecoderFLOAT16.mlpackage */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		03A8D51AC6A75082F5A88001 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
-		2B3C4D5E6F70819A2B3C4D5E /* FaceDepthController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaceDepthController.swift; sourceTree = "<group>"; };
+		A6B7C8D9E0F1A2B3C4D5E6F7 /* FaceDepthController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaceDepthController.swift; sourceTree = "<group>"; };
+		E4F5A6B7C8D9E0F1A2B3C4D5 /* LiveMapView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveMapView.swift; sourceTree = "<group>"; };
+		C2D3E4F5A6B7C8D9E0F1A2B3 /* LiveMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveMap.swift; sourceTree = "<group>"; };
 		1A2B3C4D5E6F70819A2B3C4D /* LevelMath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LevelMath.swift; sourceTree = "<group>"; };
 		09D84B125C9E32CF1AF77FDD /* ToolCutterApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCutterApp.swift; sourceTree = "<group>"; };
 		27B137FCD656B222282F41D6 /* SweepRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SweepRecorder.swift; sourceTree = "<group>"; };
@@ -34,8 +48,18 @@
 		D2FAA42CF0C33DEB5FC53DAF /* ToolCutter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ToolCutter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D3E1576A4683F425C7C0C18A /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		D530675BA00DBBF983E22BB6 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
-		B09EE13242A74946A920AA02 /* TrueDepthController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrueDepthController.swift; sourceTree = "<group>"; };
 		C09EE13242A74946A920AA02 /* CaptureTiming.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureTiming.swift; sourceTree = "<group>"; };
+		D09EDBFC7EDFB15B68BE0BD1 /* OutlineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutlineEngine.swift; sourceTree = "<group>"; };
+		84B77888AB2D249C2C4DE1A9 /* SAM2Engine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SAM2Engine.swift; sourceTree = "<group>"; };
+		B352B439915B3BE669310C7F /* OutlineCorrection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutlineCorrection.swift; sourceTree = "<group>"; };
+		07FFD6891809E713D12DBB80 /* PendingUploads.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingUploads.swift; sourceTree = "<group>"; };
+		5A42E96404E47EA3A8098787 /* ToolCaptureModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCaptureModel.swift; sourceTree = "<group>"; };
+		32011A517E701B28D4714865 /* OutlineEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutlineEditorView.swift; sourceTree = "<group>"; };
+		DBDA58F1AAB441A486F343F3 /* JobPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JobPickerView.swift; sourceTree = "<group>"; };
+		8152F46D53DD9072D0C35CED /* ToolCaptureView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCaptureView.swift; sourceTree = "<group>"; };
+		FC8285B310B1C76C762049F4 /* SAM2_1SmallImageEncoderFLOAT16.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = Models/SAM2_1SmallImageEncoderFLOAT16.mlpackage; sourceTree = "<group>"; };
+		60F41DEFD5B166ACF8D7543F /* SAM2_1SmallPromptEncoderFLOAT16.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = Models/SAM2_1SmallPromptEncoderFLOAT16.mlpackage; sourceTree = "<group>"; };
+		CBE988A242673B9F67147EEA /* SAM2_1SmallMaskDecoderFLOAT16.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = Models/SAM2_1SmallMaskDecoderFLOAT16.mlpackage; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -60,7 +84,9 @@
 			children = (
 				D530675BA00DBBF983E22BB6 /* APIClient.swift */,
 				03A8D51AC6A75082F5A88001 /* AppSettings.swift */,
-				2B3C4D5E6F70819A2B3C4D5E /* FaceDepthController.swift */,
+				A6B7C8D9E0F1A2B3C4D5E6F7 /* FaceDepthController.swift */,
+				E4F5A6B7C8D9E0F1A2B3C4D5 /* LiveMapView.swift */,
+				C2D3E4F5A6B7C8D9E0F1A2B3 /* LiveMap.swift */,
 				1A2B3C4D5E6F70819A2B3C4D /* LevelMath.swift */,
 				9B72A35FED8F44A1FCF4DE6E /* CaptureController.swift */,
 				54506DA6CFA1FFC1C2B2D381 /* CaptureView.swift */,
@@ -68,9 +94,19 @@
 				89C7352EC547C601260CE7E9 /* Info.plist */,
 				AFACBB8EC0BA02F56E889849 /* ReviewWebView.swift */,
 				27B137FCD656B222282F41D6 /* SweepRecorder.swift */,
-				B09EE13242A74946A920AA02 /* TrueDepthController.swift */,
 				C09EE13242A74946A920AA02 /* CaptureTiming.swift */,
 				09D84B125C9E32CF1AF77FDD /* ToolCutterApp.swift */,
+				D09EDBFC7EDFB15B68BE0BD1 /* OutlineEngine.swift */,
+				84B77888AB2D249C2C4DE1A9 /* SAM2Engine.swift */,
+				B352B439915B3BE669310C7F /* OutlineCorrection.swift */,
+				07FFD6891809E713D12DBB80 /* PendingUploads.swift */,
+				5A42E96404E47EA3A8098787 /* ToolCaptureModel.swift */,
+				32011A517E701B28D4714865 /* OutlineEditorView.swift */,
+				DBDA58F1AAB441A486F343F3 /* JobPickerView.swift */,
+				8152F46D53DD9072D0C35CED /* ToolCaptureView.swift */,
+				FC8285B310B1C76C762049F4 /* SAM2_1SmallImageEncoderFLOAT16.mlpackage */,
+				60F41DEFD5B166ACF8D7543F /* SAM2_1SmallPromptEncoderFLOAT16.mlpackage */,
+				CBE988A242673B9F67147EEA /* SAM2_1SmallMaskDecoderFLOAT16.mlpackage */,
 			);
 			path = ToolCutter;
 			sourceTree = "<group>";
@@ -135,15 +171,27 @@
 			files = (
 				936AF0E6FCFC2F318B58B48A /* APIClient.swift in Sources */,
 				A98CF80AA86EBCE178E9FD08 /* AppSettings.swift in Sources */,
-				2B3C4D5E6F70819A2B3C4D5F /* FaceDepthController.swift in Sources */,
+				F5A6B7C8D9E0F1A2B3C4D5E6 /* FaceDepthController.swift in Sources */,
+				D3E4F5A6B7C8D9E0F1A2B3C4 /* LiveMapView.swift in Sources */,
+				B1C2D3E4F5A6B7C8D9E0F1A2 /* LiveMap.swift in Sources */,
 				1A2B3C4D5E6F70819A2B3C4E /* LevelMath.swift in Sources */,
 				288A99CF99F1954558A81E29 /* CaptureController.swift in Sources */,
 				0042FDF08E74F43D968CB026 /* CaptureView.swift in Sources */,
 				84496BCD39F3EB38D0D503F8 /* HomeView.swift in Sources */,
 				2E1F2714E58DF4439480BA60 /* ReviewWebView.swift in Sources */,
 				D0C2FA26F47CF53C48E8A744 /* SweepRecorder.swift in Sources */,
-				B09EE13242A74946A920AA01 /* TrueDepthController.swift in Sources */,
 				C09EE13242A74946A920AA01 /* CaptureTiming.swift in Sources */,
+				146644B840EDB93E417B96B6 /* OutlineEngine.swift in Sources */,
+				2527C6D30F810DD824676799 /* SAM2Engine.swift in Sources */,
+				341796F1A9EDF2110E7441B1 /* OutlineCorrection.swift in Sources */,
+				A1C5A99F0201AEF3055318A5 /* PendingUploads.swift in Sources */,
+				E5DE6375EB4884B802771D11 /* ToolCaptureModel.swift in Sources */,
+				B325DBF459A3F8539FF130C4 /* OutlineEditorView.swift in Sources */,
+				14049E22CCCBBE1F3FC575CC /* JobPickerView.swift in Sources */,
+				C94CAB5E7A0EDE89035FC66D /* ToolCaptureView.swift in Sources */,
+				D34C3FB96F143254BB96035F /* SAM2_1SmallImageEncoderFLOAT16.mlpackage in Sources */,
+				188BA5E9D1F0E4A080185E84 /* SAM2_1SmallPromptEncoderFLOAT16.mlpackage in Sources */,
+				5B0DDFEB114FE5DDB2D72B84 /* SAM2_1SmallMaskDecoderFLOAT16.mlpackage in Sources */,
 				6080A213C05366AFB2866A82 /* ToolCutterApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
