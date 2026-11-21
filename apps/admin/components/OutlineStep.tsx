@@ -6,9 +6,11 @@ import st from './stage.module.css';
 import ed from './editor.module.css';
 import ScanViewer from './ScanViewer';
 import AddShape from './AddShape';
-import { API_BASE_URL, autoDetect, imageUrl, mergeTools, segment, snapToBase, splitTool } from '../lib/api';
+import { API_BASE_URL, autoDetect, cleanupOutlines, dismissAgentJob, getAgentJob, imageUrl, listAgentJobs, mergeTools, segment, snapToBase, startAgent, type AgentJob, type AgentLive, type AgentLogEntry, type AgentResult, type CleanupProposal } from '../lib/api';
 import { arcLengths, bestShape, shapeFromDrag, shapeTool, fitShapes, softDragRing, type ShapeFit, fmtMm, pointSegment, polyToPath, polygonArea, resampleRing, ringBounds, simplifyRing, smoothRing, toolColor, toolFromResult, uid } from '../lib/geom';
 import { PAGES, PRINT_DEFAULTS, printOutlines, type PageSize } from '../lib/print';
+import { splitOutlineTool, placedOutline, unplacedOutline, resizeShapeTool } from '../lib/outline-edit';
+import type { ToolChange } from '../lib/workspace-history';
 import type { PromptPoint, SessionInfo, ShapeKind, Tool, ToolResult } from '../lib/types';
 
 type View = { x: number; y: number; w: number; h: number };
@@ -20,6 +22,10 @@ type Drag =
   | { kind: 'cut'; start: number[]; cur: number[] };
 
 interface Props {
+  historyRevision: number;
+  captureTools: () => ToolChange;
+  selectedId: string | null;
+  setSelectedId: (id: string | null) => void;
   session: SessionInfo;
   tools: Tool[];
   setTools: React.Dispatch<React.SetStateAction<Tool[]>>;
@@ -27,7 +33,6 @@ interface Props {
   onContinue: () => void;
 }
 
-const HISTORY_MAX = 60;
 const CLICK_PX = 4;          // a press that moves less than this is a click, not a drag
 
 function newTool(session: SessionInfo, index: number, points: PromptPoint[], box: number[] | null): Tool {
@@ -54,7 +59,7 @@ function applyResult(t: Tool, r: ToolResult): Tool {
  *                       Alt+drag grabs a group, Shift/Alt+CLICK adds an include/exclude hint and re-outlines
  *    always           : drag empty space pans, wheel zooms, click a tool selects it, click the mat deselects
  */
-export default function OutlineStep({ session, tools, setTools, modelAvailable, onContinue }: Props) {
+export default function OutlineStep({ session, tools, setTools, modelAvailable, onContinue, selectedId, setSelectedId, captureTools, historyRevision }: Props) {
   const rect = session.rectified!;
   const W = rect.width;
   const H = rect.height;
@@ -65,11 +70,17 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   // drawn primitives belong to no session and are positioned on the mat, not on the scan, so they are listed
   // here (this is where you add them) but are moved and sized in Layout
   const shapes = useMemo(() => tools.filter((t) => t.source === 'shape'), [tools]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   // Tools ticked for combining. Kept apart from selectedId: one tool is being EDITED, several are being GATHERED.
   const [combineIds, setCombineIds] = useState<string[]>([]);
   const [combining, setCombining] = useState(false);
-  const selected = mine.find((t) => t.id === selectedId) ?? null;
+  // Shapes join the selectable set with a derived px ring (their polygon_mm is local to offset_mm), so the
+  // editor, Remove and Delete all work on them. Nolan, 2026-10-02: "I cant delete them and cant figure out how
+  // to edit their nodes" — they were listed but never selectable, because `selected` came from `mine` only.
+  const shapesForView = useMemo(() => shapes.map((t) => {
+    return { ...t, polygon_px: placedOutline(t).map(([x,y]) => [x / mpp,y / mpp]) };
+  }), [shapes, mpp]);
+  const allTools = useMemo(() => [...mine, ...shapesForView], [mine, shapesForView]);
+  const selected = allTools.find((t) => t.id === selectedId) ?? null;
   const editable = selected && selected.polygon_px.length >= 3 ? selected : null;
 
   const [softMm, setSoftMm] = useState(25);   // how far along the outline a dragged point carries its neighbours
@@ -79,10 +90,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const [splitArm, setSplitArm] = useState(false);
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
-  const [inspector, setInspector] = useState<'tools' | 'edit'>('tools');
   const [query, setQuery] = useState('');
-  const [recovery, setRecovery] = useState<Tool[] | null>(null);
-  useEffect(() => { if (selectedId) setInspector('edit'); }, [selectedId]);
   const [error, setError] = useState<string | null>(null);
   // refine_with_sam is only ever the no-height fallback now; it is never offered as a choice.
   const [autoOpts, setAutoOpts] = useState({ mode: 'auto' as 'auto' | 'color' | 'height', min_area_mm2: 200, height_threshold_mm: 2, refine_with_sam: !rect.has_height });
@@ -92,15 +100,23 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   const [addingShape, setAddingShape] = useState(false);
   const [drawKind, setDrawKind] = useState<Exclude<ShapeKind, 'poly'> | null>(null);
   const [snapBusy, setSnapBusy] = useState(false);
-  const [, bump] = useState(0);
+  /** Pending cleanup proposals by tool id. Nothing in here is applied until Accept; Reject just drops it. */
+  const [proposals, setProposals] = useState<Record<string, CleanupProposal>>({});
+  const [cleanBusy, setCleanBusy] = useState(false);
+  const [recogAvailable, setRecogAvailable] = useState<boolean | null>(null);
+  const [cleanNote, setCleanNote] = useState<string | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const history = useRef<Map<string, { past: number[][][]; future: number[][][] }>>(new Map());
   const timers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const reqIds = useRef<Map<string, number>>(new Map());
   const [upp, setUpp] = useState(1);
   const dragRef = useRef<Drag | null>(null);
   const lastDelta = useRef<number[]>([0, 0]);
+  useEffect(() => {
+    timers.current.forEach(clearTimeout); timers.current.clear(); reqIds.current.clear();
+    dragRef.current = null; setDrag(null); setSel(new Set()); setCombineIds([]);
+    setAutoBusy(false); setCombining(false); setSnapBusy(false);
+  }, [historyRevision]);
   useEffect(() => { dragRef.current = drag; }, [drag]);
 
   // Borders always come from the scan topography. Nolan, 2026-09-22: "I dont want to ever follow visible tool
@@ -163,13 +179,14 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
 
   /** Combine the gathered tools into one outline (server-side: their masks are unioned and the seam healed). */
   const combineSelected = useCallback(async () => {
+    const apply = captureTools();
     if (combineIds.length < 2 || combining) return;
     setCombining(true);
-    const previous = mine;
     const first = mine.find((t) => t.id === combineIds[0]);
     setError(null);
     try {
       const res = await mergeTools(session.id, combineIds);
+      if (!apply.isCurrent()) return;
       const idx = Math.max(0, tools.findIndex((t) => t.id === combineIds[0]));
       const merged = res.tools.filter((r) => r.polygon_px.length >= 3)
         .map((r, i) => {
@@ -178,8 +195,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           return nt;
         });
       if (!merged.length) { setError('Combine produced no outline; the tools were left alone.'); return; }
-      setRecovery(previous);                        // same undo affordance as "Clear list"
-      setTools((prev) => {
+      apply((prev) => {
         const rest = prev.filter((t) => !res.removed.includes(t.id));
         const at = Math.max(0, Math.min(idx, rest.length));
         return [...rest.slice(0, at), ...merged, ...rest.slice(at)];
@@ -192,7 +208,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     } finally {
       setCombining(false);
     }
-  }, [combineIds, combining, mine, tools, session.id, session.source_kind]);
+  }, [combineIds, combining, mine, tools, session.id, session.source_kind, setSelectedId, captureTools]);
 
   /** Selecting from the list zooms to the tool; clicking it on the canvas does not — you are already looking at it. */
   const selectTool = useCallback((id: string | null, fit = false) => {
@@ -202,31 +218,33 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
       const t = tools.find((x) => x.id === id);
       if (t && t.polygon_px.length >= 3) fitTo(t.polygon_px);
     }
-  }, [tools, fitTo]);
+  }, [tools, fitTo, setSelectedId]);
 
 
   // ------------------------------------------------------------------ outlining (server)
-  const runSegment = useCallback(async (tool: Tool) => {
+  const runSegment = useCallback(async (tool: Tool, apply: ToolChange) => {
     const id = (reqIds.current.get(tool.id) ?? 0) + 1;
     reqIds.current.set(tool.id, id);
     try {
       const res = await segment(session.id, [{ id: tool.id, points: tool.points, box: tool.box }], edgeSource);
       if (reqIds.current.get(tool.id) !== id) return;
-      setTools((prev) => prev.map((t) => (t.id === tool.id ? applyResult(t, res.tools[0]) : t)));
+      apply((prev) => prev.map((t) => (t.id === tool.id && t.points === tool.points && t.box === tool.box && t.polygon_px === tool.polygon_px ? applyResult(t, res.tools[0]) : t)));
     } catch (err) {
       if (reqIds.current.get(tool.id) !== id) return;
       const msg = err instanceof Error ? err.message : 'Outlining failed';
-      setTools((prev) => prev.map((t) => (t.id === tool.id ? { ...t, pending: false, error: msg } : t)));
+      apply((prev) => prev.map((t) => (t.id === tool.id && t.points === tool.points && t.box === tool.box && t.polygon_px === tool.polygon_px ? { ...t, pending: false, error: msg } : t)));
     }
-  }, [session.id, setTools, edgeSource]);
+  }, [session.id, edgeSource]);
 
   const schedule = useCallback((tool: Tool) => {
     const prev = timers.current.get(tool.id);
     if (prev) clearTimeout(prev);
-    timers.current.set(tool.id, setTimeout(() => void runSegment(tool), 180));
-  }, [runSegment]);
+    const apply = captureTools();
+    timers.current.set(tool.id, setTimeout(() => { timers.current.delete(tool.id); void runSegment(tool, apply); }, 180));
+  }, [runSegment, captureTools]);
 
-  useEffect(() => () => timers.current.forEach((t) => clearTimeout(t)), []);
+  // Queued detection belongs to the document and finishes across view switches.
+  // Its captured writer rejects the result after undo or a new scan.
 
   const updateTool = useCallback((id: string, fn: (t: Tool) => Tool, resegment = true) => {
     setTools((prev) => prev.map((t) => {
@@ -243,42 +261,28 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     setSelectedId(t.id);
     setSel(new Set());
     schedule(t);
-  }, [schedule, setTools, tools.length, session]);
+  }, [schedule, setTools, tools.length, session, setSelectedId]);
 
   const removeTool = (id: string) => {
-    setRecovery(mine);
     setTools((prev) => prev.filter((t) => t.id !== id));
     if (selectedId === id) setSelectedId(null);
   };
 
-  const doSplit = async (tool: Tool, line: [number[], number[]]) => {
-    setError(null);
-    setTools((prev) => prev.map((t) => (t.id === tool.id ? { ...t, pending: true } : t)));
+  const doSplit = (tool: Tool, line: [number[], number[]]) => {
     try {
-      const res = await splitTool(session.id, tool.id, line, edgeSource);
-      const idx = tools.findIndex((t) => t.id === tool.id);
-      const parts = res.tools.filter((r) => r.polygon_px.length >= 3).map((r, i) => {
-        const nt = toolFromResult(r, tools.length + i, session.source_kind, `${tool.name} ${String.fromCharCode(97 + i)}`);
-        if (i === 0) nt.color = tool.color;
-        return nt;
-      });
-      setTools((prev) => {
-        const rest = prev.filter((t) => t.id !== tool.id);
-        const at = Math.max(0, Math.min(idx, rest.length));
-        return [...rest.slice(0, at), ...parts, ...rest.slice(at)];
-      });
-      selectTool(parts[0]?.id ?? null);
-    } catch (err) {
-      setTools((prev) => prev.map((t) => (t.id === tool.id ? { ...t, pending: false } : t)));
-      setError(err instanceof Error ? err.message : 'Split failed');
-    }
+      const parts = splitOutlineTool(tool, line.map(p => p.map(v => v * mpp)) as [number[], number[]]);
+      setTools(prev => prev.flatMap(t => t.id === tool.id ? parts : [t]));
+      selectTool(parts[0].id); setSplitArm(false); setError(null);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Split failed'); }
   };
 
   const runAuto = async (replace: boolean) => {
+    const apply = captureTools();
     setAutoBusy(true);
     setError(null);
     try {
       const res = await autoDetect(session.id, { ...autoOpts, edge_source: edgeSource, id_prefix: `${uid('a')}_` });
+      if (!apply.isCurrent()) return;
       const others = tools.filter((t) => t.session_id !== session.id);
       const base = replace ? others.length : tools.length;
       let found: Tool[] = res.tools.filter((r) => r.polygon_px.length >= 3).map((r, i) => toolFromResult(r, base + i, session.source_kind));
@@ -291,10 +295,8 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
         });
       }
       if (!found.length) { setError("No tools found. Your existing outlines have been kept. Try adjusting detection settings or click a tool on the canvas."); return; }
-      setRecovery(mine.length ? mine : null);
-      setTools((prev) => (replace ? [...prev.filter((t) => t.session_id !== session.id), ...found] : [...prev, ...found]));
+      apply((prev) => (replace ? [...prev.filter((t) => t.session_id !== session.id), ...found] : [...prev, ...found]));
       setSelectedId(null);
-      setInspector('tools');
       setAutoOpen(false);
       if (res.sam_error) setError(`Detected by ${res.mode}; photo refinement unavailable (${res.sam_error}).`);
     } catch (err) {
@@ -305,42 +307,24 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   };
 
   // ------------------------------------------------------------------ hand edits + history
-  const commit = useCallback((id: string, poly: number[][], record = true) => {
+  const commit = useCallback((id: string, poly: number[][]) => {
     setTools((prev) => prev.map((t) => {
       if (t.id !== id) return t;
-      if (record) {
-        const h = history.current.get(id) ?? { past: [], future: [] };
-        h.past.push(t.polygon_px);
-        if (h.past.length > HISTORY_MAX) h.past.shift();
-        h.future = [];
-        history.current.set(id, h);
+      if (t.source === 'shape') {
+        if (t.shape && t.shape.kind !== 'poly') {
+          // a parametric shape RESIZES from a handle drag (circle diameter, rect width/height); it stays a shape with few
+          // nodes and editable size fields — baking it into a 200-node polygon made it "difficult to resize" (Nolan)
+          const local = unplacedOutline(t, poly.map((p) => [p[0] * mpp, p[1] * mpp]));
+          const resized = resizeShapeTool(t, local);
+          if (resized) return { ...resized, pending: false };
+        }
+        // a free polygon shape: bake — absolute mm, no offset (the nodes are the shape now)
+        return { ...t, pending: false, polygon_px: poly, polygon_mm: poly.map((p) => [p[0] * mpp, p[1] * mpp]), area_mm2: polygonArea(poly) * mpp * mpp,
+                 offset_mm: { x: 0, y: 0 }, rotation_deg: 0, shape: undefined, auto_polygon_px: t.auto_polygon_px ?? (t.polygon_px.length ? t.polygon_px : poly), edited: true };
       }
-      return { ...t, polygon_px: poly, polygon_mm: poly.map((p) => [p[0] * mpp, p[1] * mpp]), area_mm2: polygonArea(poly) * mpp * mpp, auto_polygon_px: t.auto_polygon_px ?? t.polygon_px, edited: true };
+      return { ...t, pending: false, polygon_px: poly, polygon_mm: poly.map((p) => [p[0] * mpp, p[1] * mpp]), area_mm2: polygonArea(poly) * mpp * mpp, auto_polygon_px: t.auto_polygon_px ?? t.polygon_px, edited: true };
     }));
-    bump((v) => v + 1);
   }, [mpp, setTools]);
-  const record = (t: Tool) => {
-    const h = history.current.get(t.id) ?? { past: [], future: [] };
-    h.past.push(t.polygon_px); if (h.past.length > HISTORY_MAX) h.past.shift(); h.future = []; history.current.set(t.id, h);
-  };
-  const undo = useCallback(() => {
-    if (!editable) return;
-    const h = history.current.get(editable.id);
-    if (!h?.past.length) return;
-    const prev = h.past.pop()!;
-    h.future.push(editable.polygon_px);
-    commit(editable.id, prev, false);
-    setSel(new Set());
-  }, [editable, commit]);
-  const redo = useCallback(() => {
-    if (!editable) return;
-    const h = history.current.get(editable.id);
-    if (!h?.future.length) return;
-    const next = h.future.pop()!;
-    h.past.push(editable.polygon_px);
-    commit(editable.id, next, false);
-    setSel(new Set());
-  }, [editable, commit]);
   const resetAuto = () => {
     if (!editable?.auto_polygon_px) return;
     commit(editable.id, editable.auto_polygon_px);
@@ -364,13 +348,275 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     setError(null);
     try {
       const poly = await snapToBase(session.id, t.polygon_px);
-      if (poly.length >= 3) { record(t); commit(t.id, poly, false); setSel(new Set()); }
+      if (poly.length >= 3) { commit(t.id, poly); setSel(new Set()); }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Snap to base failed');
     } finally {
       setSnapBusy(false);
     }
   };
+
+  // ------------------------------------------------------------------ knowledge-driven cleanup (proposals only)
+  /** Ask the server for cleaned outlines. The model says what each tool is and which constraints its footprint
+   *  obeys; the geometry applies them to the measured trace and refuses anything the trace does not support.
+   *  Results land in `proposals` and are drawn green over the ghosted original — Accept commits, Reject drops. */
+  const [cleanProgress, setCleanProgress] = useState<{ done: number; total: number } | null>(null);
+  /** the one-click pipeline: detect -> agent -> accept -> Design insert (Nolan: "make this workflow easier") */
+  const [preparing, setPreparing] = useState<string | null>(null);
+  const autoAcceptRef = useRef(false);
+  const doCleanup = async (targets: Tool[]) => {
+    const list = targets.filter((t) => t.source !== 'shape' && t.polygon_px.length >= 3);
+    if (!list.length) return;
+    setCleanBusy(true);
+    setError(null);
+    setCleanProgress({ done: 0, total: list.length });
+    const BATCH = 4;   // the model inspects every tool (two passes, full-resolution pictures): a minute or so per batch
+    let n = 0, unchanged = 0, recogOn: boolean | null = null, reason: string | null = null;
+    try {
+      for (let i = 0; i < list.length; i += BATCH) {
+        const chunk = list.slice(i, i + BATCH);
+        const res = await cleanupOutlines(session.id, chunk.map((t) => ({ id: t.id, polygon_px: t.polygon_px, name: t.name })));
+        recogOn = recogOn || res.recognition_available; reason = res.recognition_reason;
+        const next: Record<string, CleanupProposal> = {};
+        for (const p of res.proposals) {
+          if (p.error || p.polygon_px.length < 3) continue;
+          if (!p.applied.length) { unchanged += 1; continue; }     // nothing the trace supports: no proposal, say so
+          next[p.id] = p; n += 1;
+        }
+        setProposals((prev) => ({ ...prev, ...next }));
+        setCleanProgress({ done: Math.min(list.length, i + chunk.length), total: list.length });
+      }
+      setRecogAvailable(!!recogOn);
+      const parts = [`${n} proposal${n === 1 ? '' : 's'}`];
+      if (unchanged) parts.push(`${unchanged} left as measured (nothing to fix, or nothing the trace supports)`);
+      setCleanNote(parts.join(' · '));
+      if (!n) setError(`No clean-up to propose: ${unchanged} outline${unchanged === 1 ? '' : 's'} left as measured${recogOn ? '' : ` — tool recognition is off (${reason ?? 'no Anthropic credentials on the server'}), so only constraints the trace itself proves can apply`}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Clean up failed');
+    } finally {
+      setCleanBusy(false);
+      setCleanProgress(null);
+    }
+  };
+  const acceptProposal = (p: CleanupProposal) => {
+    const t = tools.find((x) => x.id === p.id);
+    if (t) commit(t.id, p.polygon_px);
+    setProposals((prev) => { const n = { ...prev }; delete n[p.id]; return n; });
+    setSel(new Set());
+  };
+  const rejectProposal = (id: string) => setProposals((prev) => { const n = { ...prev }; delete n[id]; return n; });
+
+  // ------------------------------------------------------------------ the drawer agent (whole-drawer, with tools)
+  const [agentJob, setAgentJob] = useState<AgentJob | null>(null);
+  const [agentLog, setAgentLog] = useState<AgentLogEntry[]>([]);
+  const [agentResult, setAgentResult] = useState<AgentResult | null>(null);
+  /** the working outlines while the agent runs — drawn green on the canvas as each change lands */
+  const [agentLive, setAgentLive] = useState<AgentLive | null>(null);
+  const [agentInstructions, setAgentInstructions] = useState('');
+  const agentPoll = useRef<number | null>(null);
+  const stopAgentPoll = () => { if (agentPoll.current) { window.clearTimeout(agentPoll.current); agentPoll.current = null; } };
+  /** Follow a job (new or rediscovered): stream its log every 2 s until it is done, then show the proposal. */
+  const followAgent = useCallback((jobId: string) => {
+    stopAgentPoll();
+    let since = 0;
+    const tick = async () => {
+      try {
+        const j = await getAgentJob(jobId, since);
+        since = j.log_total;
+        if (j.log.length) setAgentLog((prev) => [...prev, ...j.log]);
+        setAgentJob(j);
+        if (j.live) setAgentLive(j.live);
+        if (j.status === 'done' && j.result) {
+          setAgentResult(j.result); setAgentLive(null);
+          if (autoAcceptRef.current) { autoAcceptRef.current = false; applyAgentResult(j.result, jobId); setPreparing(null); onContinue(); }
+          return;
+        }
+        if (j.status === 'error') { setError(`Agent failed: ${j.error ?? 'unknown error'}`); autoAcceptRef.current = false; setPreparing(null); return; }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Agent status failed'); autoAcceptRef.current = false; setPreparing(null); return;
+      }
+      agentPoll.current = window.setTimeout(() => void tick(), 2000);
+    };
+    agentPoll.current = window.setTimeout(() => void tick(), 300);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // The job lives on the server, so leaving this step (or opening another drawer) and coming back must find it again:
+  // a running job is followed, a finished one that was not yet accepted/rejected is shown. (Nolan: "I lose the agent if
+  // I change tabs or drawers.")
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const jobs = await listAgentJobs(session.id);
+        if (cancelled) return;
+        const live = jobs.find((j) => j.status === 'running') ?? jobs.find((j) => j.status === 'done' && !j.dismissed);
+        if (live) {
+          setAgentLog([]);
+          setAgentJob({ id: live.id, status: live.status, error: live.error, log: [], log_total: 0, seconds: live.seconds });
+          followAgent(live.id);
+        }
+      } catch { /* the backend may be away; the button still works */ }
+    })();
+    return () => { cancelled = true; stopAgentPoll(); };
+  }, [session.id, followAgent]);
+  /** Start the agent on every scanned tool; the log streams in while it works, the proposal arrives at the end. */
+  const runAgent = async () => {
+    const list = mine.filter((t) => t.polygon_px.length >= 3);
+    if (!list.length) return;
+    setError(null); setAgentResult(null); setAgentLog([]); setProposals({});
+    try {
+      const { job_id } = await startAgent(session.id, list.map((t) => ({ id: t.id, name: t.name, polygon_px: t.polygon_px })), agentInstructions);
+      setAgentJob({ id: job_id, status: 'running', error: null, log: [], log_total: 0, seconds: 0 });
+      followAgent(job_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not start the agent');
+      setAgentJob(null);
+    }
+  };
+  /** Apply the agent's proposal: drop removed tools, replace changed ones, add new ones (names from the agent). */
+  const applyAgentResult = (res: AgentResult, jobId?: string) => {
+    setTools((prev) => {
+      const byId = new Map(prev.map((t) => [t.id, t]));
+      const kept = prev.filter((t) => t.session_id !== session.id || !res.removed.includes(t.id));
+      const out: Tool[] = kept.filter((t) => t.session_id !== session.id);
+      let idx = 0;
+      for (const r of res.tools) {
+        const old = byId.get(r.id);
+        if (old && !r.changed) { out.push(old); idx += 1; continue; }
+        const made = toolFromResult({ ...r, session_id: r.session_id || session.id }, idx, old?.source ?? 'scan', r.name ?? old?.name);
+        if (old) Object.assign(made, { include: old.include, clearance_mm: old.clearance_mm, depth_mm: old.depth_mm, rotation_deg: old.rotation_deg, offset_mm: old.offset_mm, notch: old.notch, color: old.color,
+                                      auto_polygon_px: old.auto_polygon_px ?? old.polygon_px, edited: true });
+        else made.edited = !!r.edited;
+        out.push(made); idx += 1;
+      }
+      return out;
+    });
+    setSelectedId(null); setCombineIds([]); setSel(new Set());
+    const jid = jobId ?? agentJob?.id;
+    if (jid) void dismissAgentJob(jid).catch(() => undefined);
+    setAgentResult(null); setAgentLive(null); setAgentJob(null);
+  };
+  const acceptAgent = () => { if (agentResult) applyAgentResult(agentResult); };
+  /** Detect (if nothing is detected yet), run the agent, accept its proposal, and open Design insert — one click. */
+  const prepareDrawer = async () => {
+    if (preparing) return;
+    setError(null);
+    try {
+      if (!mine.some((t) => t.polygon_px.length >= 3)) {
+        setPreparing('Detecting tools…');
+        await runAuto(true);
+      }
+      setPreparing('Agent is inspecting the drawer…');
+      autoAcceptRef.current = true;
+      await runAgent();                       // completion is handled in followAgent (auto-accept + continue)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Prepare failed');
+      autoAcceptRef.current = false; setPreparing(null);
+    }
+  };
+  // `?prepare=1` on the URL (the phone can add it when it opens a fresh capture) runs the pipeline on arrival
+  const preparedOnce = useRef(false);
+  useEffect(() => {
+    if (preparedOnce.current || typeof window === 'undefined') return;
+    if (new URLSearchParams(window.location.search).get('prepare') === '1' && rect.has_height) {
+      preparedOnce.current = true;
+      const t = window.setTimeout(() => void prepareDrawer(), 1500);
+      return () => window.clearTimeout(t);
+    }
+  }, [rect.has_height]); // eslint-disable-line react-hooks/exhaustive-deps
+  const rejectAgent = () => { if (agentJob) void dismissAgentJob(agentJob.id).catch(() => undefined); setAgentResult(null); setAgentLive(null); setAgentJob(null); setAgentLog([]); };
+  const agentGhosts = useMemo(() => {
+    const g: Record<string, number[][]> = {};
+    const src = agentResult?.tools ?? agentLive?.tools ?? [];
+    for (const r of src) if (r.changed && r.polygon_mm.length >= 3) g[r.id] = r.polygon_mm;
+    return g;
+  }, [agentResult, agentLive]);
+  /** tools the agent has removed (split parents, merged originals, debris): drawn very faint until Accept/Reject */
+  const agentRemoved = useMemo(() => agentResult?.removed ?? agentLive?.removed ?? [], [agentResult, agentLive]);
+  const describeAgentStep = (e: AgentLogEntry) => {
+    const i = e.input ?? {};
+    const id = typeof i.tool_id === 'string' ? (tools.find((t) => t.id === i.tool_id)?.name ?? i.tool_id) : '';
+    switch (e.tool) {
+      case 'start': return `Started · ${e.summary}`;
+      case 'says': return e.summary;
+      case 'view_drawer': return 'Looked at the whole drawer';
+      case 'list_tools': return 'Listed the tools';
+      case 'view_tool': return `Looked at ${id}`;
+      case 'height_profile': return `Measured heights across ${id} (marks ${i.from_mark}–${i.to_mark})`;
+      case 'split_tool': return `Split ${id} along marks ${i.from_mark}–${i.to_mark} → ${e.summary}`;
+      case 'merge_tools': return `Merged ${(i.tool_ids as string[] | undefined)?.join(', ')} → ${e.summary}`;
+      case 'redetect_tool': return `Re-detected ${id} at ${i.height_threshold_mm} mm → ${e.summary}`;
+      case 'edit_outline': return `Edited ${id}: ${e.summary}`;
+      case 'fit_shape': return `Fitted a ${i.shape_class} to ${id}: ${e.summary}`;
+      case 'rename_tool': return `Named ${i.tool_id} “${i.name}”`;
+      case 'remove_tool': return `Removed ${id}: ${i.reason}`;
+      case 'undo_tool': return `Undid the last change to ${id}`;
+      case 'finish': return `Finished: ${e.summary}`;
+      case 'error': return `Error: ${e.summary}`;
+      default: return `${e.tool}: ${e.summary}`;
+    }
+  };
+  const ghosts = useMemo(() => {
+    const g: Record<string, number[][]> = {};
+    for (const p of Object.values(proposals)) g[p.id] = p.polygon_mm;
+    return g;
+  }, [proposals]);
+  const allGhosts = useMemo(() => ({ ...ghosts, ...agentGhosts }), [ghosts, agentGhosts]);
+  /** One line per constraint the engine applied or refused, in plain words with the millimetres. */
+  const describeStep = (st: CleanupProposal['applied'][number]): string => {
+    const f = (k: string) => st[k] as number | undefined;
+    switch (st.type) {
+      case 'circle': return `Circle, radius ${(f('radius_mm') ?? 0).toFixed(1)} mm (fit within ${(f('p95_residual_mm') ?? 0).toFixed(2)} mm)`;
+      case 'mirror_symmetry': return `Mirrored about the ${st.axis as string} axis (${Math.round(((f('cover') ?? 0) * 100))} % of points matched, median mismatch ${(f('median_mismatch_mm') ?? 0).toFixed(1)} mm)`;
+      case 'parallel_edges': return `Straight edges made parallel (largest correction ${(f('max_correction_deg') ?? 0).toFixed(1)}°)`;
+      case 'right_angles': return `Edges squared to 90° (was ${(90 + (f('correction_deg') ?? 0)).toFixed(1)}°)`;
+      case 'rectangle': { const sz = st.size_mm as number[] | undefined; return `Rectangle ${sz ? `${sz[0]} × ${sz[1]} mm` : ''} (${Math.round(((f('iou_with_trace') ?? 0) * 100))} % overlap with the trace)`; }
+      case 'local_straight': return `Marks ${st.from_mark}–${st.to_mark}: straightened (points were up to ${(f('max_move_mm') ?? 0).toFixed(1)} mm off the line)${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_arc': return `Marks ${st.from_mark}–${st.to_mark}: made a circular arc, radius ${(f('radius_mm') ?? 0).toFixed(1)} mm${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_spur': return `Marks ${st.from_mark}–${st.to_mark}: spur cut off (${((f('area_change_mm2') ?? 0) / 100).toFixed(2)} cm², up to ${(f('max_move_mm') ?? 0).toFixed(1)} mm)${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_notch': return `Marks ${st.from_mark}–${st.to_mark}: notch bridged (+${((f('area_change_mm2') ?? 0) / 100).toFixed(2)} cm²)${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_too_tight': return `Marks ${st.from_mark}–${st.to_mark}: moved out ${Math.abs(f('moved_mm') ?? 0).toFixed(1)} mm to the photo edge${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_too_loose': return `Marks ${st.from_mark}–${st.to_mark}: moved in ${Math.abs(f('moved_mm') ?? 0).toFixed(1)} mm to the photo edge${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_merged_neighbour': return `Marks ${st.from_mark}–${st.to_mark}: the model thinks a second object is included here — consider ⌘-drag to split${st.note ? ` — ${st.note}` : ''}`;
+      case 'local_missing_part': return `Marks ${st.from_mark}–${st.to_mark}: the model thinks part of the tool is outside the trace here (not changed)${st.note ? ` — ${st.note}` : ''}`;
+      default: return st.type;
+    }
+  };
+  const proposalCard = (p: CleanupProposal) => {
+    const t = tools.find((x) => x.id === p.id);
+    const r = p.recognition;
+    return (
+      <div key={p.id} className={ed.proposal}>
+        <div className={ui.rowBetween}>
+          <strong style={{ fontSize: 13 }}>{t?.name ?? p.id}</strong>
+          {r && <span className={ui.toolMeta} title={r.notes}>looks like {r.tool_name} · {Math.round(r.confidence * 100)} % · trace {r.trace_quality.replace('_', ' ')}</span>}
+        </div>
+        {r?.description && <p className={ui.hint} style={{ margin: 0 }}>{r.description}</p>}
+        {p.preview_png && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={`data:image/png;base64,${p.preview_png}`} alt={`Proposed outline (green) over the measured trace (orange) for ${t?.name ?? p.id}, with numbered marks`}
+               style={{ width: '100%', maxHeight: 320, objectFit: 'contain', borderRadius: 8, background: '#000' }} />
+        )}
+        <ul className={ed.proposalList}>
+          {p.applied.map((st, i) => <li key={i}>{describeStep(st)}</li>)}
+          {p.refused.map((st, i) => <li key={`r${i}`} className={ed.refused}>Not applied — {st.type}: {st.refused as string}</li>)}
+        </ul>
+        {p.verification && (
+          <div className={ed.stat}><span>Model's check</span><span>{p.verification.follows_edge ? 'green line follows the tool everywhere' : p.verification.issues.length ? `${p.verification.issues.length} spot${p.verification.issues.length === 1 ? '' : 's'} re-worked in a second round` : 'reservations noted'}{p.verification.notes ? ` — ${p.verification.notes}` : ''}</span></div>
+        )}
+        <div className={ed.stat}><span>Largest move</span><span>{p.max_move_mm.toFixed(1)} mm</span></div>
+        <div className={ed.stat}><span>Area</span><span>{(p.area_before_mm2 / 100).toFixed(2)} → {(p.area_after_mm2 / 100).toFixed(2)} cm² ({p.area_change_pct >= 0 ? '+' : ''}{p.area_change_pct.toFixed(1)} %)</span></div>
+        <div className={ui.row}>
+          <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnPrimary}`} onClick={() => acceptProposal(p)}>✓ Accept</button>
+          <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => rejectProposal(p.id)}>✕ Reject</button>
+          {r && t && r.confidence >= 0.6 && r.tool_name && r.tool_name.toLowerCase() !== 'unknown' && t.name.toLowerCase() !== r.tool_name.toLowerCase() && (
+            <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnGhost}`} title="Rename this tool to what the model recognised"
+              onClick={() => updateTool(t.id, (x) => ({ ...x, name: r.tool_name }), false)}>Name it “{r.tool_name}”</button>
+          )}
+        </div>
+      </div>
+    );
+  };
+  const pendingProposals = Object.values(proposals).filter((p) => tools.some((t) => t.id === p.id));
 
   const doSimplify = () => { if (editable) { commit(editable.id, simplifyRing(editable.polygon_px, 0.3 / mpp)); setSel(new Set()); } };
   const doResample = () => { if (editable) { commit(editable.id, resampleRing(editable.polygon_px, stepPx)); setSel(new Set()); } };
@@ -415,10 +661,10 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
     const pts = Array.from(sel).map((i) => poly[i]).filter(Boolean);
     return [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
   };
-  const transformSel = (fn: (p: number[], c: number[]) => number[], recordIt = true) => {
+  const transformSel = (fn: (p: number[], c: number[]) => number[]) => {
     if (!editable || !sel.size) return;
     const c = selCentroid(editable.polygon_px);
-    commit(editable.id, editable.polygon_px.map((p, i) => (sel.has(i) ? fn(p, c) : p)), recordIt);
+    commit(editable.id, editable.polygon_px.map((p, i) => (sel.has(i) ? fn(p, c) : p)));
   };
   const rotateSel = (deg: number) => {
     const a = (deg * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
@@ -445,7 +691,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
 
   useEffect(() => {
     const d = dragRef.current;
-    if (d?.kind === 'vertices' && d.moved && !d.rigid && editable) commit(editable.id, softRing(d, lastDelta.current[0], lastDelta.current[1]), false);
+    if (d?.kind === 'vertices' && d.moved && !d.rigid && editable) commit(editable.id, softRing(d, lastDelta.current[0], lastDelta.current[1]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [softMm]);
 
@@ -468,8 +714,9 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
   // ------------------------------------------------------------------ keyboard
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); if (e.shiftKey) redo(); else undo(); return; }
+      if ((e.target as HTMLElement)?.closest('input, textarea, select, [contenteditable=true]')) return;
+      if (e.key.toLowerCase() === 'v' && !e.metaKey && !e.ctrlKey) { setDrawKind(null); setSplitArm(false); return; }
+      if (e.key === 'Escape') { setDrawKind(null); setSplitArm(false); }
       // Escape must still clear combine ticks when no tool is being edited, so the guard allows that case
       // through; every branch below that needs a tool checks for one.
       if (!selected && !combineIds.length) return;
@@ -487,80 +734,38 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
       else if (e.key === '[') rotateSel(-1);
       else if (e.key === ']') rotateSel(1);
       else if (e.key.toLowerCase() === 'a' && (e.metaKey || e.ctrlKey)) { setSel(new Set(editable.polygon_px.map((_, i) => i))); e.preventDefault(); }
-      else if (e.key.toLowerCase() === 'f') fitTo(editable.polygon_px);
+
     };
     window.addEventListener('keydown', down);
     return () => window.removeEventListener('keydown', down);
   }); // re-bind every render: handlers close over the latest selection
 
-  const hist = editable ? history.current.get(editable.id) : undefined;
   const ready = tools.filter((t) => t.polygon_mm.length >= 3).length;
-  const imported = tools.length - mine.length;
+  const imported = tools.filter(t => t.source === 'object');
 
   return (
-    <div className={st.layoutGrid}>
-      <div className={st.stageWrap}>
-        <div className={st.toolbar}>
-          <label className={ed.slider} title="How far along the outline a dragged point carries its neighbours. 0 = move that one point only. The wheel changes it while you drag.">
-            <span className={ui.label}>Reshape radius</span>
-            <input type="range" min={0} max={120} step={1} value={softMm} disabled={!editable} onChange={(e) => setSoftMm(Number(e.target.value))} />
-            <span className={ui.unit}>{softMm ? `${softMm} mm` : 'off'}</span>
-          </label>
-          <div className={ui.segmented} role="group" aria-label="Drawing tools" title="Drag on the mat to draw a shape (Shift = square, Alt = corner-to-corner for circles)">
-            {([[null, '↖'], ['rect', '▭'], ['slot', '⬭'], ['circle', '○'], ['hex', '⬡']] as [Exclude<ShapeKind, 'poly'> | null, string][]).map(([k, icon]) => (
-              <button key={icon} type="button" className={drawKind === k ? ui.segActive : ''} onClick={() => setDrawKind(k)}
-                aria-pressed={drawKind === k} title={k ? `Draw a ${k}` : 'Select / edit'}>{icon} {k === null ? 'Select' : k === 'rect' ? 'Rectangle' : k === 'circle' ? 'Circle' : k === 'slot' ? 'Slot' : 'Hex'}</button>
-            ))}
-          </div>
-          <span className={st.toolbarSpacer} />
-          <button type="button" className={ui.btn} disabled={!hist?.past.length} onClick={undo} title="Undo outline edit (⌘/Ctrl Z)">↶ Undo</button>
-          <button type="button" className={ui.btn} disabled={!hist?.future.length} onClick={redo} title="Redo outline edit (⌘/Ctrl Shift Z)">↷ Redo</button>
-        </div>
-        <div className={ed.guidance} aria-live="polite">
-          <div><strong>{drawKind ? `Draw a ${drawKind === 'rect' ? 'rectangle' : drawKind}` : selected ? `Editing ${selected.name}` : drawn.length ? 'Choose an outline to refine' : 'Your scan is ready'}</strong>
-          {drawKind ? 'Drag across the mat. Choose Select when you are finished.' : selected ? 'Drag an edge handle to reshape. Changes can be undone.' : drawn.length ? 'Select a tool on the canvas or in the tool list.' : 'Start with Detect tools, or click a tool on the scan to outline it.'}</div>
-          <span>Drag to orbit · scroll to zoom · right-drag to pan</span>
-        </div>
-        {session.scan?.photo_coverage && <details className={ui.disclosure}>
-          <summary>Photo coverage · {Math.round(session.scan.photo_coverage.covered_fraction * 100)}% of drawer · {session.scan.photo_coverage.photo_count} photos</summary>
-          <p className={ui.hint}>Green: overlapping views. Amber: one view or partial overlap. Red: missing coverage. Add overlapping photos over red or amber areas before cutting.</p>
-          <div role="img" aria-label="Drawer photo coverage, from top left to bottom right" style={{ display: 'grid', gridTemplateColumns: `repeat(${session.scan.photo_coverage.cols}, 1fr)`, gap: 3, gridTemplateRows: `repeat(${session.scan.photo_coverage.rows}, 1fr)`, width: Math.min(600, 220 * (session.mat_mm?.width || 1) / (session.mat_mm?.height || 1)), maxWidth: '100%', aspectRatio: `${session.mat_mm?.width || 1} / ${session.mat_mm?.height || 1}` }}>
-            {session.scan.photo_coverage.covered.flatMap((row, y) => row.map((coverage, x) => <span key={`${x}-${y}`} title={`Row ${y + 1}, column ${x + 1}: ${Math.round(coverage * 100)}% covered`} style={{ minHeight: 0, borderRadius: 3, background: coverage < .95 ? '#dc735e' : session.scan!.photo_coverage!.overlap[y][x] < .5 ? '#e0b551' : '#5b966b' }} />))}
-          </div>
-          <p className={ui.hint}>Coverage confirms where photos exist; it does not certify focus or dimensional accuracy.</p>
-        </details>}
-        {recovery && <div className={ed.notice} role="status"><span>Previous tool list available.</span><button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => { setTools(prev => [...prev.filter(t => t.session_id !== session.id), ...recovery]); setRecovery(null); setSelectedId(null); }}>Undo list change</button><button className={ui.iconBtn} aria-label="Dismiss undo message" onClick={() => setRecovery(null)}>×</button></div>}
-        <ScanViewer session={session} tools={[...mine, ...shapes]} selectedId={selectedId} onSelect={(id) => selectTool(id)} softMm={softMm}
-          tickedIds={combineIds} onToggleSelect={toggleCombine}
-          edit={{
-            onEditStart: (id) => { const t = tools.find((x) => x.id === id); if (t) record(t); },
-            onEdit: (id, poly) => commit(id, poly, false),
-            onCreate: (x, y) => {
-              if (!canClick) { setError('Click-to-outline needs scan height data or the HQ-SAM checkpoint. Use Auto-detect instead.'); return; }
-              addTool([{ x: Math.round(x), y: Math.round(y), label: 'pos' }], null);
-            },
-            onHint: (id, x, y, label) => updateTool(id, (t) => ({ ...t, points: [...t.points, { x: Math.round(x), y: Math.round(y), label }] })),
-            onSplit: (id, line) => { const t = tools.find((x) => x.id === id); if (t) void doSplit(t, line); },
-            onDrawShape: (a, bpt, mods) => {
-              if (!drawKind) return;
-              const made = shapeFromDrag(drawKind, a, bpt, mods);
-              if (!made) return;
-              setTools((prev) => [...prev, shapeTool(made.spec, 20, tools, made.at)]);   // stays armed: draw several in a row
-            },
-          }} drawArmed={drawKind !== null} splitArmed={splitArm} />
-        {error && <div role="alert" className={ui.error}>{error}</div>}
-      </div>
-
-      <aside className={`${ui.panel} ${ed.inspector}`} aria-label="Outline inspector">
-        <div className={ed.inspectorTabs} role="tablist" aria-label="Inspector">
-          <button type="button" role="tab" aria-selected={inspector === 'tools'} onClick={() => setInspector('tools')}>Tools <span className={ui.badge}>{mine.length}</span></button>
-          <button type="button" role="tab" aria-selected={inspector === 'edit'} onClick={() => setInspector('edit')}>Edit outline</button>
-        </div>
+    <div className={ed.modelingGrid}>
+      <aside className={`${ui.panel} ${ed.inspector} ${ed.outliner}`} aria-label="Scene objects">
+        <div className={ed.dockTitle}>Tools <span>{tools.length} objects</span></div>
         <div className={ed.inspectorBody}>
-        {inspector === 'tools' && <>
         <div className={ui.section}>
           <div className={ui.rowBetween}>
-            <h2 className={ui.panelTitle}>Auto-detect</h2>
+            {rect.has_height && (
+
+              <div className={ui.section} style={{ paddingTop: 0 }}>
+
+                <button type="button" className={`${ui.btn} ${ui.btnPrimary} ${ui.btnBlock}`} disabled={!!preparing || agentJob?.status === 'running' || autoBusy}
+
+                  title="Detect the tools, let the agent split merged ones, fix and smooth every outline and name them, then open Design insert — one click"
+
+                  onClick={() => void prepareDrawer()}>{preparing ? <span className={ui.spinner} /> : '⚡'} {preparing ?? 'Prepare drawer'}</button>
+
+                <p className={ui.hint}>Detect → agent clean-up → Design insert, hands-off. You can still undo everything afterwards.</p>
+
+              </div>
+
+            )}
+            <h2 className={ui.panelTitle}>Scan actions</h2>
             <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnGhost}`} onClick={() => setAutoOpen(!autoOpen)}
               aria-expanded={autoOpen} title={autoOpen ? 'Hide detection settings' : 'Show detection settings'}>{autoOpen ? 'Hide settings' : 'Settings'}</button>
           </div>
@@ -608,13 +813,15 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
         </div>
 
         <div className={ui.section}>
-          <div className={ui.rowBetween}>
+          <div className={`${ui.rowBetween} ${ed.sceneHeading}`}>
             <h2 className={ui.panelTitle}>Tools ({mine.length})</h2>
             <span className={ui.row} style={{ gap: 6 }}>
               {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Replace every traced outline with the simple shape that fits it best" onClick={simplifyAll}>◻ Shapes</button>}
+              {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={cleanBusy} title="Recognise every tool and propose a cleaned outline for each — straight edges straightened, right angles squared, symmetric tools mirrored. Nothing is applied until you accept it." onClick={() => void doCleanup(drawn)}>{cleanBusy ? <span className={ui.spinner} /> : '✨'} {cleanBusy && cleanProgress ? `Inspecting ${cleanProgress.done} / ${cleanProgress.total}…` : 'Clean up all'}</button>}
+              {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={agentJob?.status === 'running'} title="Let the model work through the whole drawer: it looks at each tool, splits merged detections, merges cut ones, re-detects, edits outlines by marks, and checks its work. Several minutes. You accept or reject the result." onClick={() => void runAgent()}>{agentJob?.status === 'running' ? <span className={ui.spinner} /> : '🤖'} {agentJob?.status === 'running' ? `Agent working · ${Math.round(agentJob.seconds)} s` : 'Agent'}</button>}
               {drawn.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Print every outline at 1:1, one tool after another" onClick={() => doPrint(drawn)}>🖨 All</button>}
               <button type="button" className={`${ui.btn} ${ui.btnSm}`} title="Add a plain rectangle, slot, circle or hexagon — for something the scan cannot see" onClick={() => setAddingShape(!addingShape)}>+ Shape</button>
-              {mine.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} onClick={() => { setRecovery(mine); setTools((prev) => prev.filter((t) => t.session_id !== session.id)); setSelectedId(null); setCombineIds([]); }}>Clear list</button>}
+              {mine.length > 0 && <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} onClick={() => { setTools((prev) => prev.filter((t) => t.session_id !== session.id)); setSelectedId(null); setCombineIds([]); }}>Clear list</button>}
               {combineIds.length > 0 && (
                 <>
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={combineIds.length < 2 || combining}
@@ -638,7 +845,7 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           <input className={ui.input} type="search" placeholder="Search tools…" aria-label="Search tools" value={query} onChange={e => setQuery(e.target.value)} />
           <div className={ui.list}>
             {mine.filter(t => t.name.toLowerCase().includes(query.toLowerCase())).map((t) => (
-              <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
+              <div key={t.id} className={`${ui.toolRow} ${ed.sceneRow} ${t.id === selectedId ? ui.toolRowActive : ''}`}
                    style={combineIds.includes(t.id) ? { outline: '2px solid var(--accent, #f26a1b)', outlineOffset: '-2px' } : undefined}
                    onClick={(e) => (e.metaKey || e.ctrlKey || e.shiftKey) ? toggleCombine(t.id) : selectTool(t.id, true)}>
                 <span className={ui.swatch} style={{ background: t.color }} />
@@ -656,17 +863,17 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
               </div>
             ))}
             {!mine.length && <div className={ui.emptyState}><strong>Start with an outline</strong>Detect all tools at once, or click a tool on the canvas to add it individually.</div>}
-            {!!mine.length && !mine.some(t => t.name.toLowerCase().includes(query.toLowerCase())) && <p className={ui.hint}>No tools match “{query}”.</p>}
+            {!!tools.length && !tools.some(t => t.name.toLowerCase().includes(query.toLowerCase())) && <p className={ui.hint}>No tools match “{query}”.</p>}
             {mine.length > 1 && !combineIds.length && <p className={ui.hint}>Cmd/Ctrl-click tools — here or on the scan — to tick several, then Combine them into one outline.</p>}
-            {imported > 0 && <p className={ui.hint}>{imported} imported tool model{imported > 1 ? 's' : ''} will join these in the layout.</p>}
+            {imported.filter(t => t.name.toLowerCase().includes(query.toLowerCase())).map(t => <button type="button" key={t.id} className={ui.btn} onClick={() => { setSelectedId(t.id); onContinue(); }}><span className={ui.swatch} style={{ background:t.color }} />{t.name} · Open in insert ↗</button>)}
           </div>
           {shapes.length > 0 && (
             <div className={ui.list} style={{ marginTop: 6 }}>
-              <p className={ui.hint}>Added shapes — these sit on the foam, not on the scan, so you place and size them in Layout &amp; export.</p>
-              {shapes.map((t) => (
-                <div key={t.id} className={ui.toolRow} style={{ gridTemplateColumns: '12px 1fr auto auto' }}>
+              <p className={ui.hint}>Added shapes — click one to edit its nodes or remove it; its size stays editable in Design insert until a node is moved.</p>
+              {shapes.filter(t => t.name.toLowerCase().includes(query.toLowerCase())).map((t) => (
+                <div key={t.id} className={`${ui.toolRow} ${t.id === selectedId ? ui.toolRowActive : ''}`} style={{ gridTemplateColumns: '12px 1fr auto auto' }} onClick={() => selectTool(t.id)}>
                   <span className={ui.swatch} style={{ background: t.color }} />
-                  <span className={ui.toolName}>{t.name}</span>
+                  <button type="button" className={ui.toolName} onClick={(e) => { e.stopPropagation(); selectTool(t.id); }}>{t.name}</button>
                   <span className={ui.toolMeta}>{fmtMm(t.measured_thickness_mm)} thick</span>
                   <button type="button" className={ui.iconBtn} title="Remove" onClick={() => setTools((prev) => prev.filter((x) => x.id !== t.id))}>×</button>
                 </div>
@@ -675,8 +882,133 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           )}
         </div>
 
-        </>}
-        {inspector === 'edit' && (selected ? (
+        {session.scan?.photo_coverage && <details className={ui.disclosure}>
+          <summary>Photo coverage · {Math.round(session.scan.photo_coverage.covered_fraction * 100)}% of drawer · {session.scan.photo_coverage.photo_count} photos</summary>
+          <p className={ui.hint}>Green: overlapping views. Amber: one view or partial overlap. Red: missing coverage. Add overlapping photos over red or amber areas before cutting.</p>
+          <div role="img" aria-label="Drawer photo coverage, from top left to bottom right" style={{ display: 'grid', gridTemplateColumns: `repeat(${session.scan.photo_coverage.cols}, 1fr)`, gap: 3, gridTemplateRows: `repeat(${session.scan.photo_coverage.rows}, 1fr)`, width: Math.min(600, 220 * (session.mat_mm?.width || 1) / (session.mat_mm?.height || 1)), maxWidth: '100%', aspectRatio: `${session.mat_mm?.width || 1} / ${session.mat_mm?.height || 1}` }}>
+            {session.scan.photo_coverage.covered.flatMap((row, y) => row.map((coverage, x) => <span key={`${x}-${y}`} title={`Row ${y + 1}, column ${x + 1}: ${Math.round(coverage * 100)}% covered`} style={{ minHeight: 0, borderRadius: 3, background: coverage < .95 ? '#dc735e' : session.scan!.photo_coverage!.overlap[y][x] < .5 ? '#e0b551' : '#5b966b' }} />))}
+          </div>
+          <p className={ui.hint}>Coverage confirms where photos exist; it does not certify focus or dimensional accuracy.</p>
+        </details>}
+        </div>
+      </aside>
+      <div className={`${st.stageWrap} ${ed.modelingViewport}`}>
+        <div className={st.toolbar}>
+          <div className={ui.segmented} role="group" aria-label="Drawing tools" title="Drag on the mat to draw a shape (Shift = square, Alt = corner-to-corner for circles)">
+            {([[null, '↖'], ['rect', '▭'], ['slot', '⬭'], ['circle', '○'], ['hex', '⬡']] as [Exclude<ShapeKind, 'poly'> | null, string][]).map(([k, icon]) => (
+              <button key={icon} type="button" className={drawKind === k ? ui.segActive : ''} onClick={() => setDrawKind(k)}
+                aria-pressed={drawKind === k} title={k ? `Draw a ${k}` : 'Select / edit (V)'}>{icon} {k === null ? 'Select' : k === 'rect' ? 'Rectangle' : k === 'circle' ? 'Circle' : k === 'slot' ? 'Slot' : 'Hex'}</button>
+            ))}
+          </div>
+          <span className={st.toolbarSpacer} />
+        </div>
+        <div className={ed.guidance} aria-live="polite">
+          <div><strong>{drawKind ? `Draw a ${drawKind === 'rect' ? 'rectangle' : drawKind}` : selected ? `Editing ${selected.name}` : drawn.length ? 'Choose an outline to refine' : 'Your scan is ready'}</strong>
+          {drawKind ? 'Drag across the mat. Choose Select when you are finished.' : selected ? 'Ctrl-drag: split outline · Shift-drag: select nodes · Drag a selected node to move the group.' : drawn.length ? 'Select a tool on the canvas or in the tool list.' : 'Start with Detect tools, or click a tool on the scan to outline it.'}</div>
+          <span>Drag to orbit · scroll to zoom · right-drag to pan</span>
+        </div>
+        <ScanViewer selectedVertices={sel} onSelectVertices={setSel} historyRevision={historyRevision} session={session} tools={allTools} selectedId={selectedId} onSelect={(id) => selectTool(id)} softMm={softMm}
+          tickedIds={combineIds} onToggleSelect={toggleCombine} ghosts={allGhosts} removedIds={agentRemoved}
+          edit={{
+            onEdit: (id, poly) => {
+              const t=tools.find(t=>t.id===id);
+              commit(id, t && t.source !== 'shape' ? unplacedOutline(t,poly.map(p=>p.map(v=>v*mpp))).map(p=>p.map(v=>v/mpp)) : poly);
+            },
+            onCreate: (x, y) => {
+              if (!canClick) { setError('Click-to-outline needs scan height data or the HQ-SAM checkpoint. Use Auto-detect instead.'); return; }
+              addTool([{ x: Math.round(x), y: Math.round(y), label: 'pos' }], null);
+            },
+            onHint: (id, x, y, label) => updateTool(id, (t) => ({ ...t, points: [...t.points, { x: Math.round(x), y: Math.round(y), label }] })),
+            onSplit: (id, line) => { const t = tools.find((x) => x.id === id); if (t) void doSplit(t, line); },
+            onDrawShape: (a, bpt, mods) => {
+              if (!drawKind) return;
+              const made = shapeFromDrag(drawKind, a, bpt, mods);
+              if (!made) return;
+              setTools((prev) => [...prev, shapeTool(made.spec, 20, tools, made.at)]);   // stays armed: draw several in a row
+            },
+          }} drawArmed={drawKind !== null} splitArmed={splitArm} />
+        {error && <div role="alert" className={ui.error}>{error}</div>}
+        {(agentJob || agentResult) && (
+          <div className={ui.section}>
+            <div className={ui.rowBetween}>
+              <h2 className={ui.panelTitle}>{agentResult ? `Agent proposal · ${agentResult.changed.length} changed, ${agentResult.removed.length} removed` : `Agent working · ${agentLog.length} steps${agentLive ? ` · ${agentLive.changed.length} changed so far` : ''}`}</h2>
+              {agentResult && (
+                <span className={ui.row} style={{ gap: 6 }}>
+                  <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnPrimary}`} onClick={acceptAgent}>✓ Accept all changes</button>
+                  <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={rejectAgent}>✕ Reject</button>
+                </span>
+              )}
+            </div>
+            {!agentResult && agentLive && agentLive.changed.length > 0 && (
+              <ul className={ed.proposalList}>
+                {agentLive.tools.filter((t) => t.changed).map((t) => <li key={t.id}>{t.name ?? t.id} · {t.status}{t.new ? ' · new' : ''}{t.area_mm2 != null ? ` · ${(t.area_mm2 / 100).toFixed(1)} cm²` : ''}</li>)}
+                {agentLive.removed.length > 0 && <li className={ed.refused}>removed: {agentLive.removed.map((id) => tools.find((t) => t.id === id)?.name ?? id).join(', ')}</li>}
+              </ul>
+            )}
+            {!agentResult && <p className={ui.hint}>Green outlines on the canvas are the agent's working changes; faint ones are tools it has removed. Nothing is applied until you accept.</p>}
+            {agentResult && <p className={ui.hint} style={{ whiteSpace: 'pre-wrap' }}>{agentResult.summary || '(no summary)'} <span className={ui.toolMeta}>· {agentResult.calls} tool calls · {Math.round(agentResult.seconds)} s · stopped on {agentResult.stopped} · {((agentResult.usage.input_tokens + agentResult.usage.output_tokens) / 1000).toFixed(0)}k tokens</span></p>}
+            {agentResult && agentResult.tools.some((r) => r.changed && r.status === 'renamed') && (
+              <p className={ui.hint}>Named: {agentResult.tools.filter((r) => r.changed && r.status === 'renamed').map((r) => r.name ?? r.id).join(', ')}</p>
+            )}
+            {agentResult && agentResult.tools.filter((r) => r.changed && r.status !== 'renamed').map((r) => (
+              <div key={r.id} className={ed.proposal}>
+                <div className={ui.rowBetween}><strong style={{ fontSize: 13 }}>{r.name ?? r.id}{r.new ? ' · new' : ''}</strong><span className={ui.toolMeta}>{r.status}</span></div>
+                {r.preview_png && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={`data:image/png;base64,${r.preview_png}`} alt={`${r.name ?? r.id}: new outline (green) over the previous one (orange)`} style={{ width: '100%', maxHeight: 280, objectFit: 'contain', borderRadius: 8, background: '#000' }} />
+                )}
+                <div className={ed.stat}><span>Area</span><span>{(r.area_mm2 / 100).toFixed(2)} cm²</span></div>
+              </div>
+            ))}
+            {agentResult && agentResult.removed.length > 0 && <p className={ui.hint}>Removed: {agentResult.removed.map((id) => tools.find((t) => t.id === id)?.name ?? id).join(', ')}</p>}
+            <details className={ui.disclosure} open={!agentResult}><summary>Log · {agentLog.length} steps</summary>
+              <ol className={ed.agentLog}>
+                {agentLog.map((e, i) => <li key={i} className={e.error ? ed.refused : undefined}><span className={ui.toolMeta}>{e.t.toFixed(0)} s</span> {describeAgentStep(e)}</li>)}
+              </ol>
+            </details>
+            {!agentResult && <label className={ui.field} style={{ marginTop: 6 }}><span className={ui.label}>Instructions for the next run (optional)</span>
+              <input className={`${ui.input} ${ui.inputSm}`} value={agentInstructions} onChange={(e) => setAgentInstructions(e.target.value)} placeholder="e.g. the black tape measure is 89.5 mm wide; leave the sockets alone" /></label>}
+          </div>
+        )}
+        {pendingProposals.length > 0 && (
+          <div className={ui.section}>
+            <div className={ui.rowBetween}>
+              <h2 className={ui.panelTitle}>Proposed clean-ups ({pendingProposals.length})</h2>
+              <span className={ui.row} style={{ gap: 6 }}>
+                <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnPrimary}`} onClick={() => pendingProposals.forEach(acceptProposal)}>✓ Accept all</button>
+                <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => setProposals({})}>✕ Reject all</button>
+              </span>
+            </div>
+            <p className={ui.hint}>{cleanNote ? `${cleanNote}. ` : ''}Green line = proposed, faded line = as measured. {recogAvailable === false ? 'Tool recognition is off (no Anthropic credentials on the server), so only constraints the trace itself proves were applied.' : 'Each card says what the tool was taken to be and what changed, in millimetres.'}</p>
+            {pendingProposals.filter((p) => p.id === selectedId).concat(pendingProposals.filter((p) => p.id !== selectedId)).map(proposalCard)}
+          </div>
+        )}
+      </div>
+
+      <aside className={`${ui.panel} ${ed.inspector} ${ed.properties}`} aria-label="Object properties" data-history-fields>
+        <div className={ed.dockTitle}>Properties <span>{selected ? 'Outline' : 'No selection'}</span></div>
+        <div className={ed.inspectorBody}>
+          <label className={ed.slider} title="How far along the outline a dragged point carries its neighbours. 0 = move that one point only. The wheel changes it while you drag.">
+            <span className={ui.label}>Reshape radius</span>
+            <input type="range" min={0} max={120} step={1} value={softMm} disabled={!editable} onChange={(e) => setSoftMm(Number(e.target.value))} />
+            <span className={ui.unit}>{softMm ? `${softMm} mm` : 'off'}</span>
+          </label>
+        {selected && selected.source === 'shape' ? (
+          <div className={ui.section}>
+            <h2 className={ui.panelTitle}>{selected.shape ? 'Shape' : 'Shape (free outline)'}</h2>
+            <label className={ui.label}>Name<input className={ui.input} value={selected.name} onChange={e => updateTool(selected.id, t => ({ ...t, name: e.target.value }), false)} /></label>
+            <div className={ed.stat}><span>Nodes</span><span>{selected.polygon_px.length} · {sel.size} selected</span></div>
+            <div className={ed.stat}><span>Area</span><span>{(selected.area_mm2 / 100).toFixed(2)} cm²</span></div>
+            {selected.shape && selected.shape.kind !== 'poly' && (
+              <div className={ed.stat}><span>Size</span><span>{fmtMm(selected.shape.w_mm)} × {fmtMm(selected.shape.h_mm)}{selected.shape.r_mm ? ` · r ${fmtMm(selected.shape.r_mm)}` : ''}</span></div>
+            )}
+            <p className={ui.hint}>{selected.shape ? (selected.shape.kind === 'poly' ? 'Drag a node on the canvas to reshape it.' : 'Drag a node on the canvas to resize it — it stays a true circle / rectangle. Size and placement are also editable in Design insert.') : 'A free outline: drag its nodes on the canvas, or move the whole shape in Design insert.'}</p>
+            <div className={ui.row} style={{ marginTop: 8 }}>
+              <button type="button" className={`${ui.btn} ${ui.btnSm} ${ui.btnDanger}`} onClick={() => removeTool(selected.id)}>Remove</button>
+            </div>
+          </div>
+        ) : selected ? (
+
           <div className={ui.section}>
             <h2 className={ui.panelTitle}>Edit outline</h2>
             <label className={ui.label}>Tool name<input className={ui.input} value={selected.name} onChange={e => updateTool(selected.id, t => ({ ...t, name: e.target.value }), false)} /></label>
@@ -698,8 +1030,6 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
                   <div className={ed.stat}><span>vs. detected</span><span>{((editable.area_mm2 / Math.max(1e-6, polygonArea(editable.auto_polygon_px) * mpp * mpp) - 1) * 100).toFixed(1)} %</span></div>
                 )}
                 <div className={ui.row} style={{ marginTop: 8 }}>
-                  <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={!hist?.past.length} onClick={undo} title="⌘Z">Undo</button>
-                  <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={!hist?.future.length} onClick={redo} title="⇧⌘Z">Redo</button>
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={!editable.edited} onClick={resetAuto}>Reset to detected</button>
                 </div>
                 {sel.size > 0 && (
@@ -715,6 +1045,8 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={() => doSmoothAll(2.5)} title="Gaussian smoothing, 2.5 mm, whole outline">Smooth 2.5 mm</button>
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={snapBusy} title="Slide every point outward to where the tool actually meets the mat — the detected edge sits half-way up the wall"
                     onClick={() => void doSnapBase(editable)}>{snapBusy ? <span className={ui.spinner} /> : '⤢'} Snap to base</button>
+                  {editable.source !== 'shape' && <button type="button" className={`${ui.btn} ${ui.btnSm}`} disabled={cleanBusy} title="Recognise this tool and propose a cleaned outline (straight edges, right angles, symmetry). Shown green over the measured line; nothing changes until you accept."
+                    onClick={() => void doCleanup([editable])}>{cleanBusy ? <span className={ui.spinner} /> : '✨'} Clean up</button>}
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={doSimplify} title="Fewer handles (0.3 mm tolerance)">Fewer handles</button>
                   <button type="button" className={`${ui.btn} ${ui.btnSm}`} onClick={doResample} title="One handle per millimetre">More handles</button>
                 </div>
@@ -770,12 +1102,12 @@ export default function OutlineStep({ session, tools, setTools, modelAvailable, 
           <div className={ui.section}>
             <p className={ui.hint}>Click a tool on the image to fix its outline by hand, or click bare mat to outline something the detector missed.</p>
           </div>
-        ))}
+        )}
         </div>
         <div className={ed.footer}>
           <p>{ready ? `${ready} outline${ready === 1 ? '' : 's'} ready for the foam layout` : 'Add at least one outline to continue'}</p>
           <button type="button" className={`${ui.btn} ${ui.btnPrimary} ${ui.btnBlock}`} disabled={!ready || autoBusy || mine.some(t => t.pending)} onClick={onContinue}>
-            Arrange foam layout →
+            Design insert →
           </button>
         </div>
       </aside>

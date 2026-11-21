@@ -500,6 +500,25 @@ def rectify_rgbd(img_bgr: np.ndarray, depth_m: np.ndarray, K: np.ndarray, marker
     # camera sits at the origin above the floor: make the normal point toward it
     if n @ np.zeros(3) + d < 0:
         n, d = -n, -d
+    # THE DRAWER FLOOR IS THE NEAR PLANE. When the LiDAR view runs past the drawer's edge it also sees the room
+    # floor, a parallel plane ~3x farther, and RANSAC is bistable between the two: on Nolan's scan a7af39bd92eb
+    # (2026-10-01) frame 45 locked onto the room floor (D = 960 mm with the drawer at 306) while its neighbour
+    # frame 44, same view, chose the drawer. That one frame was rectified at 2.5x the wrong scale and painted a
+    # giant ghost of the tools across the mosaic (floor noise 7.3 mm). 15 of that scan's 63 frames see both
+    # planes, so this is routine, not rare. The bulk of a drawer frame's depth IS the drawer floor and tool tops
+    # sit closer still, so a plane farther than 1.3x the median point depth has grabbed the wrong surface:
+    # refit on the near points only.
+    med_depth = float(np.median(pts[:, 2])) if len(pts) else 0.0
+    if med_depth > 0 and float(d) > 1.3 * med_depth:
+        near = pts[pts[:, 2] < 1.3 * med_depth]
+        if len(near) >= 200:
+            n2, d2, inl2 = fit_plane_ransac(near, iters=300, thresh=4.0)
+            if n2 @ np.zeros(3) + d2 < 0:
+                n2, d2 = -n2, -d2
+            if 0 < d2 <= 1.3 * med_depth:
+                log.info("rectify_rgbd: plane fit grabbed a far plane (D %.0f mm, median depth %.0f) — refit on near points: D %.0f", d, med_depth, d2)
+                n, d = n2, d2
+                inl = np.zeros(len(pts), bool); inl[pts[:, 2] < 1.3 * med_depth] = inl2
     D = float(d)                                  # distance camera -> plane along the normal
     # plane frame: origin under the camera, x = image right, y = image down (projected onto the plane)
     c = -n * D
