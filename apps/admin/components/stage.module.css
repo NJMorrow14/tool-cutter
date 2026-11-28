@@ -142,3 +142,7 @@
 @media(max-width:600px) { .toolbar { gap:6px; padding:8px; } .dropzone { padding:30px 16px; min-height:220px; } }
 
 .sheet { height:clamp(440px, calc(100vh - 340px), 900px); }
+
+/* Compact modeling commands; allow the viewport to use the remaining window. */
+.toolbar { background:var(--panel); padding:8px; border-bottom:1px solid var(--border); gap:6px; }
+.toolbar button { font-size:11px; padding:6px 8px; }
